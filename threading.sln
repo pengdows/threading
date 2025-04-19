@@ -1,0 +1,22 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "threading", "threading\threading.csproj", "{C404E9BC-BDE2-4BA4-A0F8-B6F2334117C9}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "threading.Tests", "threading.Tests\threading.Tests.csproj", "{F686B318-A461-4215-A3DA-E2F57F01281D}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{C404E9BC-BDE2-4BA4-A0F8-B6F2334117C9}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C404E9BC-BDE2-4BA4-A0F8-B6F2334117C9}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C404E9BC-BDE2-4BA4-A0F8-B6F2334117C9}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C404E9BC-BDE2-4BA4-A0F8-B6F2334117C9}.Release|Any CPU.Build.0 = Release|Any CPU
+		{F686B318-A461-4215-A3DA-E2F57F01281D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F686B318-A461-4215-A3DA-E2F57F01281D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F686B318-A461-4215-A3DA-E2F57F01281D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F686B318-A461-4215-A3DA-E2F57F01281D}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
