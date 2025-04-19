@@ -15,7 +15,7 @@ public class CpuTestHelper
             {
                 // Perform useless work to keep the CPU busy
                 double x = 0;
-                for (int i = 0; i < 100_000; i++)
+                for (var i = 0; i < 100_000; i++)
                 {
                     x += Math.Sqrt(i) * Math.PI / Math.E;
                 }

@@ -35,7 +35,7 @@ public class AdaptiveConcurrencyTests
             }
         };
 
-        for (int i = 0; i < 32; i++)
+        for (var i = 0; i < 32; i++)
         {
             converge.Queue(() => CpuTestHelper.BurnCpu(TimeSpan.FromSeconds(2)));
         }
@@ -46,5 +46,36 @@ public class AdaptiveConcurrencyTests
         // Assert
         Assert.NotEmpty(observedConcurrency);
         Assert.Contains(observedConcurrency, c => c < 4); // should scale down at least once
+    }
+
+
+    [Fact]
+    public async Task AdaptiveConcurrency_ScalesUpAsCpuUsageDrops()
+    {
+        var observedConcurrency = new List<int>();
+        var adaptive = new AdaptiveConfig(
+            TargetCpuUsagePercent: 90f,
+            MinConcurrency: 1,
+            MaxConcurrency: 8,
+            SamplingInterval: TimeSpan.FromSeconds(1)
+        );
+
+        var converge = new ConvergeWait(1, adaptiveConfig: adaptive, logger: NullLogger<ConvergeWait>.Instance);
+        converge.OnConcurrencyChanged += c =>
+        {
+            lock (observedConcurrency)
+            {
+                observedConcurrency.Add(c);
+            }
+        };
+
+        for (var i = 0; i < 16; i++)
+        {
+            converge.Queue(async () => await Task.Delay(500));
+        }
+
+        await converge.WaitForAllAsync();
+        Assert.NotEmpty(observedConcurrency);
+        Assert.Contains(observedConcurrency, c => c > 1);
     }
 }

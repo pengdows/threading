@@ -15,7 +15,7 @@ public class ConvergeWaitTests
     {
         // Arrange
         var converge = new ConvergeWait(1);
-        bool taskRan = false;
+        var taskRan = false;
 
         converge.Queue(() =>
         {
@@ -42,7 +42,7 @@ public class ConvergeWaitTests
         var converge = new ConvergeWait(20);
         var taskRan = false;
 
-        int numberOfTasks = 100;
+        var numberOfTasks = 100;
         for (var i = 0; i < numberOfTasks; i++)
         {
             converge.Queue(() =>
@@ -68,8 +68,8 @@ public class ConvergeWaitTests
     public async Task Queue_Multiple_Tasks_Respects_Concurrency()
     {
         var converge = new ConvergeWait(4);
-        int count = 0;
-        for (int i = 0; i < 20; i++)
+        var count = 0;
+        for (var i = 0; i < 20; i++)
             converge.Queue(async () =>
             {
                 await Task.Delay(10);
@@ -83,7 +83,7 @@ public class ConvergeWaitTests
     [Fact]
     public async Task RetryPolicy_RetryXTimes_SucceedsEventually()
     {
-        int attempts = 0;
+        var attempts = 0;
         var converge = new ConvergeWait(1);
         converge.SetRetryPolicy(RetryPolicy.Retry(3));
         converge.Queue(() =>
@@ -117,7 +117,7 @@ public class ConvergeWaitTests
         converge.OnQueued += _ => queued++;
         converge.OnCompleted += _ => completed++;
 
-        for (int i = 0; i < 5; i++)
+        for (var i = 0; i < 5; i++)
             converge.Queue(() => Task.CompletedTask);
 
         await converge.WaitForAllAsync();
@@ -129,7 +129,7 @@ public class ConvergeWaitTests
     public async Task DisposeAsync_CleansUpResources()
     {
         var converge = new ConvergeWait(2);
-        for (int i = 0; i < 10; i++)
+        for (var i = 0; i < 10; i++)
         {
             converge.Queue(async () => await Task.Delay(10));
         }
@@ -143,9 +143,9 @@ public class ConvergeWaitTests
     {
         using var cts = new CancellationTokenSource();
         var converge = new ConvergeWait(1, cancellationToken: cts.Token);
-        int started = 0;
+        var started = 0;
 
-        for (int i = 0; i < 10; i++)
+        for (var i = 0; i < 10; i++)
         {
             converge.Queue(async () =>
             {
@@ -190,7 +190,7 @@ public class ConvergeWaitTests
             }
         };
 
-        for (int i = 0; i < 32; i++)
+        for (var i = 0; i < 32; i++)
             converge.Queue(() => CpuTestHelper.BurnCpu(TimeSpan.FromSeconds(2)));
 
         await converge.WaitForAllAsync();
