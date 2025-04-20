@@ -33,7 +33,7 @@ jobs:
 
       - name: Pack NuGet package
         run: |
-          dotnet pack pengdows.threading/pengdows.threading.csproj \
+          dotnet pack ./threading/threading.csproj  \
             --configuration Release \
             --no-build \
             /p:Version=0.0.${{ steps.version.outputs.value }} \
