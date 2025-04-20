@@ -1,5 +1,8 @@
 # pengdows.threading
+
 [![NuGet](https://img.shields.io/nuget/v/pengdows.threading.svg)](https://www.nuget.org/packages/pengdows.threading)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Build](https://github.com/pengdows/threading/actions/workflows/nuget-publish.yml/badge.svg)](https://github.com/pengdows/threading/actions)
 
 A high-performance .NET 8 task coordination utility that limits concurrency, supports adaptive CPU-based scaling, and includes built-in retry logic.
 
