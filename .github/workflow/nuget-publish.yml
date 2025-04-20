@@ -1,0 +1,46 @@
+name: Build, Test & Publish NuGet
+
+on:
+  push:
+    tags:
+      - 'v*'  # Only run when you push a version tag like v1.0.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.x'
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build solution
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Run tests
+        run: dotnet test --configuration Release --no-build --no-restore --verbosity normal
+
+      - name: Get Unix timestamp version
+        id: version
+        run: echo "value=$(date +%s)" >> $GITHUB_OUTPUT
+
+      - name: Pack NuGet package
+        run: |
+          dotnet pack pengdows.threading/pengdows.threading.csproj \
+            --configuration Release \
+            --no-build \
+            /p:Version=0.0.${{ steps.version.outputs.value }} \
+            --output ./nupkgs
+
+      - name: Publish to NuGet
+        run: |
+          dotnet nuget push ./nupkgs/*.nupkg \
+            --api-key ${{ secrets.NUGET_API_KEY }} \
+            --source https://api.nuget.org/v3/index.json

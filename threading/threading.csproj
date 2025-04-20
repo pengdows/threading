@@ -3,6 +3,7 @@
     <PropertyGroup>
         <TargetFramework>net8.0</TargetFramework>
         <LangVersion>12</LangVersion>
+        <Version>0.0.0</Version> <!-- will be overridden by GitHub Actions -->
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <AssemblyName>pengdows.threading</AssemblyName>
@@ -10,8 +11,14 @@
         <PackageId>pengdows.threading</PackageId>
         <Title>pengdows.threading</Title>
         <Authors>pengdows.threading</Authors>
-        <Company>Pengdows    </Company>
+        <Company>Pengdows</Company>
         <Product>pengdows.threading</Product>
+        <Description>Concurrency and task management tools including ConvergeWait with adaptive throttling.</Description>
+        <Copyright>2025</Copyright>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <PackageProjectUrl>https://github.com/pengdows/threading</PackageProjectUrl>
+        <RepositoryUrl>https://github.com/pengdows/threading</RepositoryUrl>
+        <RepositoryType>Github</RepositoryType>
     </PropertyGroup>
 
     <ItemGroup>
@@ -19,3 +26,4 @@
     </ItemGroup>
 
 </Project>
+
