@@ -138,6 +138,37 @@ public class ConvergeWaitTests
         // No assert, just ensure Dispose doesn't throw
     }
 
+    [Fact]
+    public async Task Queue_CanceledTask_IsRecordedAsFailure()
+    {
+        var converge = new ConvergeWait(1);
+        converge.Queue(() => throw new OperationCanceledException());
+
+        await converge.WaitForAllAsync();
+
+        Assert.Equal(1, converge.TotalFailed);
+        Assert.True(converge.HasFailures);
+        Assert.Equal(0, converge.TotalCompleted);
+    }
+
+    [Fact]
+    public async Task Queue_CanceledTask_IsNotRetried()
+    {
+        var attempts = 0;
+        var converge = new ConvergeWait(1);
+        converge.SetRetryPolicy(RetryPolicy.Retry(5));
+        converge.Queue(() =>
+        {
+            attempts++;
+            throw new OperationCanceledException();
+        });
+
+        await converge.WaitForAllAsync();
+
+        Assert.Equal(1, attempts);
+        Assert.Equal(1, converge.TotalFailed);
+    }
+
     [Fact(Skip = "Unreliable in CI environments due to CPU variability")]
     public async Task Tasks_StopOnCancellation()
     {

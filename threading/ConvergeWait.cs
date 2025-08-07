@@ -86,6 +86,14 @@ public sealed class ConvergeWait : IConvergeWait
                         OnCompleted?.Invoke(completed);
                         break;
                     }
+                    catch (OperationCanceledException oce)
+                    {
+                        attempts++;
+                        _logger?.LogWarning(oce, "Task canceled on attempt {Attempt}", attempts);
+                        lock (_lock) _exceptions.Add(oce);
+                        OnError?.Invoke(oce);
+                        break;
+                    }
                     catch (Exception ex)
                     {
                         attempts++;
