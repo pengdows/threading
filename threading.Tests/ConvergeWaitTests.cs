@@ -40,7 +40,6 @@ public class ConvergeWaitTests
         // Arrange
         var s = Stopwatch.StartNew();
         var converge = new ConvergeWait(20);
-        var taskRan = false;
 
         var numberOfTasks = 100;
         for (var i = 0; i < numberOfTasks; i++)
@@ -70,14 +69,39 @@ public class ConvergeWaitTests
         var converge = new ConvergeWait(4);
         var count = 0;
         for (var i = 0; i < 20; i++)
+        {
             converge.Queue(async () =>
             {
                 await Task.Delay(10);
                 Interlocked.Increment(ref count);
             });
+        }
         await converge.WaitForAllAsync();
         Assert.Equal(20, converge.TotalCompleted);
         Assert.Equal(20, count);
+    }
+
+    [Fact]
+    public async Task MaxInFlight_NeverExceedsLimit()
+    {
+        const int limit = 4;
+        var converge = new ConvergeWait(limit);
+        var inFlight = 0;
+        var maxInFlight = 0;
+
+        for (var i = 0; i < 100; i++)
+        {
+            converge.Queue(async () =>
+            {
+                var cur = Interlocked.Increment(ref inFlight);
+                UpdateMax(ref maxInFlight, cur);
+                await Task.Delay(20);
+                Interlocked.Decrement(ref inFlight);
+            });
+        }
+
+        await converge.WaitForAllAsync();
+        Assert.True(maxInFlight <= limit, $"Observed {maxInFlight} > {limit}");
     }
 
     [Fact]
@@ -118,7 +142,9 @@ public class ConvergeWaitTests
         converge.OnCompleted += _ => completed++;
 
         for (var i = 0; i < 5; i++)
+        {
             converge.Queue(() => Task.CompletedTask);
+        }
 
         await converge.WaitForAllAsync();
         Assert.Equal(5, queued);
@@ -136,6 +162,14 @@ public class ConvergeWaitTests
 
         await converge.DisposeAsync();
         // No assert, just ensure Dispose doesn't throw
+    }
+
+    [Fact]
+    public async Task Queue_AfterDispose_Throws()
+    {
+        var converge = new ConvergeWait(1);
+        await converge.DisposeAsync();
+        Assert.Throws<ObjectDisposedException>(() => converge.Queue(() => Task.CompletedTask));
     }
 
     [Fact(Skip = "Unreliable in CI environments due to CPU variability")]
@@ -191,10 +225,40 @@ public class ConvergeWaitTests
         };
 
         for (var i = 0; i < 32; i++)
+        {
             converge.Queue(() => CpuTestHelper.BurnCpu(TimeSpan.FromSeconds(2)));
+        }
 
         await converge.WaitForAllAsync();
         Assert.NotEmpty(observedConcurrency);
         Assert.Contains(observedConcurrency, c => c < 4);
+    }
+
+    [Fact]
+    public async Task RetryPolicy_DoesNotRetryCanceledException()
+    {
+        var attempts = 0;
+        var converge = new ConvergeWait(1);
+        converge.SetRetryPolicy(RetryPolicy.Retry(3));
+        converge.Queue(() =>
+        {
+            attempts++;
+            throw new OperationCanceledException();
+        });
+
+        await converge.WaitForAllAsync();
+        Assert.Equal(1, attempts);
+        Assert.Equal(1, converge.TotalFailed);
+    }
+
+    private static void UpdateMax(ref int target, int value)
+    {
+        int initial, computed;
+        do
+        {
+            initial = target;
+            computed = Math.Max(initial, value);
+        }
+        while (initial != Interlocked.CompareExchange(ref target, computed, initial));
     }
 }

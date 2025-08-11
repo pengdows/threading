@@ -24,6 +24,9 @@ public sealed class ConvergeWait : IConvergeWait
     private readonly ILogger<ConvergeWait>? _logger;
 
     private int _currentConcurrency;
+    private int _desiredConcurrency;
+    private readonly object _scaleLock = new();
+    private volatile bool _disposed;
     private Task? _monitorTask;
     private RetryPolicy _retryPolicy = RetryPolicy.None;
     private int _totalCompleted = 0;
@@ -52,6 +55,7 @@ public sealed class ConvergeWait : IConvergeWait
         _cancellationToken = cancellationToken;
         _adaptiveConfig = adaptiveConfig;
         _currentConcurrency = maxConcurrency;
+        _desiredConcurrency = maxConcurrency;
         _semaphore = new SemaphoreSlim(maxConcurrency, maxConcurrency);
         _logger = logger;
 
@@ -70,6 +74,7 @@ public sealed class ConvergeWait : IConvergeWait
     public void Queue(Func<Task> workItem)
     {
         if (workItem == null) throw new ArgumentNullException(nameof(workItem));
+        if (_disposed) throw new ObjectDisposedException(nameof(ConvergeWait));
 
         var task = Task.Run(async () =>
         {
@@ -77,13 +82,13 @@ public sealed class ConvergeWait : IConvergeWait
             try
             {
                 var attempts = 0;
-                while (true)
+                for (;;)
                 {
                     try
                     {
                         await workItem().ConfigureAwait(false);
                         var completed = Interlocked.Increment(ref _totalCompleted);
-                        OnCompleted?.Invoke(completed);
+                        InvokeSafely(OnCompleted, completed);
                         break;
                     }
                     catch (Exception ex)
@@ -91,16 +96,22 @@ public sealed class ConvergeWait : IConvergeWait
                         attempts++;
                         _logger?.LogWarning(ex, "Task attempt {Attempt} failed", attempts);
 
-                        if (_retryPolicy.Mode == RetryMode.None ||
-                            (_retryPolicy.Mode == RetryMode.RetryXTimes && attempts > _retryPolicy.MaxRetries))
+                        var shouldRetry = ShouldRetry(ex) &&
+                                         (_retryPolicy.Mode != RetryMode.RetryXTimes ||
+                                          attempts <= _retryPolicy.MaxRetries);
+                        if (!shouldRetry || _retryPolicy.Mode == RetryMode.None)
                         {
-                            lock (_lock) _exceptions.Add(ex);
-                            OnError?.Invoke(ex);
+                            lock (_lock)
+                            {
+                                _exceptions.Add(ex);
+                            }
+                            InvokeSafely(OnError, ex);
                             _logger?.LogError(ex, "Task failed permanently after {Attempts} attempts", attempts);
                             break;
                         }
 
-                        await Task.Delay(_retryPolicy.RetryDelay, _cancellationToken).ConfigureAwait(false);
+                        var delay = ComputeDelay(_retryPolicy.RetryDelay, attempts);
+                        await Task.Delay(delay, _cancellationToken).ConfigureAwait(false);
                     }
                 }
             }
@@ -114,24 +125,42 @@ public sealed class ConvergeWait : IConvergeWait
         {
             _tasks.Add(task);
             var queued = Interlocked.Increment(ref _totalQueued);
-            OnQueued?.Invoke(queued);
+            InvokeSafely(OnQueued, queued);
         }
     }
 
     public async Task WaitForAllAsync()
     {
         Task[] snapshot;
-        lock (_lock) snapshot = _tasks.ToArray();
+        lock (_lock)
+        {
+            snapshot = _tasks.ToArray();
+        }
+
         await Task.WhenAll(snapshot).ConfigureAwait(false);
+
+        lock (_lock)
+        {
+            _tasks.RemoveAll(static t => t.IsCompleted);
+        }
     }
 
     public async ValueTask DisposeAsync()
     {
-        _internalCts.Cancel();
-        if (_monitorTask != null) await _monitorTask.ConfigureAwait(false);
+        if (_disposed)
+        {
+            return;
+        }
 
-        await _semaphore.WaitAsync().ConfigureAwait(false);
-        _semaphore.Release();
+        _disposed = true;
+        _internalCts.Cancel();
+        if (_monitorTask != null)
+        {
+            await _monitorTask.ConfigureAwait(false);
+        }
+
+        await WaitForAllAsync().ConfigureAwait(false);
+
         _semaphore.Dispose();
         _internalCts.Dispose();
     }
@@ -172,11 +201,82 @@ public sealed class ConvergeWait : IConvergeWait
 
             if (newConcurrency != _currentConcurrency)
             {
-                _currentConcurrency = newConcurrency;
-                OnConcurrencyChanged?.Invoke(_currentConcurrency);
+                ApplyScale(newConcurrency);
                 _logger?.LogInformation("Concurrency adjusted to {Concurrency} due to CPU usage: {CpuUsage:F2}%",
                     _currentConcurrency, cpuUsage);
             }
+        }
+    }
+
+    private void ApplyScale(int newConcurrency)
+    {
+        lock (_scaleLock)
+        {
+            var delta = newConcurrency - _desiredConcurrency;
+            _desiredConcurrency = newConcurrency;
+            if (delta > 0)
+            {
+                _semaphore.Release(delta);
+            }
+            else if (delta < 0)
+            {
+                _ = Task.Run(async () =>
+                {
+                    for (var i = 0; i < -delta && !_internalCts.IsCancellationRequested; i++)
+                    {
+                        await _semaphore.WaitAsync(_internalCts.Token).ConfigureAwait(false);
+                    }
+                }, _internalCts.Token);
+            }
+
+            _currentConcurrency = newConcurrency;
+            InvokeSafely(OnConcurrencyChanged, _currentConcurrency);
+        }
+    }
+
+    private static bool ShouldRetry(Exception ex)
+    {
+        return ex is not (OperationCanceledException or TaskCanceledException or OutOfMemoryException or StackOverflowException);
+    }
+
+    private static TimeSpan ComputeDelay(TimeSpan baseDelay, int attempt)
+    {
+        var multiplier = Math.Pow(2, attempt - 1);
+        var jitter = TimeSpan.FromMilliseconds(Random.Shared.Next(0, (int)baseDelay.TotalMilliseconds));
+        return TimeSpan.FromMilliseconds(baseDelay.TotalMilliseconds * multiplier) + jitter;
+    }
+
+    private void InvokeSafely(Action<int>? handler, int arg)
+    {
+        if (handler == null)
+        {
+            return;
+        }
+
+        try
+        {
+            handler(arg);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Event handler threw");
+        }
+    }
+
+    private void InvokeSafely(Action<Exception>? handler, Exception ex)
+    {
+        if (handler == null)
+        {
+            return;
+        }
+
+        try
+        {
+            handler(ex);
+        }
+        catch (Exception log)
+        {
+            _logger?.LogError(log, "Event handler threw");
         }
     }
 }
