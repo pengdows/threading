@@ -49,15 +49,16 @@ public class AdaptiveConcurrencyTests
     }
 
 
-    [Fact(Skip = "Unreliable in CI environments due to CPU variability")]
+    [Fact]
     public async Task AdaptiveConcurrency_ScalesUpAsCpuUsageDrops()
     {
+        // Arrange: Configure for aggressive scale-up when CPU is idle
         var observedConcurrency = new List<int>();
         var adaptive = new AdaptiveConfig(
-            TargetCpuUsagePercent: 90f,
+            TargetCpuUsagePercent: 95f, // Very high target - any idle time should trigger scale up
             MinConcurrency: 1,
             MaxConcurrency: 8,
-            SamplingInterval: TimeSpan.FromSeconds(1)
+            SamplingInterval: TimeSpan.FromMilliseconds(500) // Fast sampling for quicker response
         );
 
         var converge = new ConvergeWait(1, adaptiveConfig: adaptive, logger: NullLogger<ConvergeWait>.Instance);
@@ -69,12 +70,15 @@ public class AdaptiveConcurrencyTests
             }
         };
 
-        for (var i = 0; i < 16; i++)
+        // Queue many tasks with delays (low CPU) to give adaptive time to scale up
+        for (var i = 0; i < 30; i++)
         {
-            converge.Queue(async () => await Task.Delay(500));
+            converge.Queue(async () => await Task.Delay(300));
         }
 
         await converge.WaitForAllAsync();
+
+        // Assert: Should have scaled up at least once
         Assert.NotEmpty(observedConcurrency);
         Assert.Contains(observedConcurrency, c => c > 1);
     }

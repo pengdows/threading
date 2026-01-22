@@ -22,11 +22,13 @@ public sealed class ConvergeWait : IConvergeWait
     private readonly AdaptiveConfig? _adaptiveConfig;
     private readonly CancellationTokenSource _internalCts = new();
     private readonly ILogger<ConvergeWait>? _logger;
+    private readonly int _maxConcurrency;
 
     private int _currentConcurrency;
+    private int _reservedSlots; // Slots held to reduce effective concurrency
     private Task? _monitorTask;
     private RetryPolicy _retryPolicy = RetryPolicy.None;
-    private int _totalCompleted = 0;
+    private int _totalCompleted;
     private int _totalQueued;
 
     public event Action<int>? OnQueued;
@@ -52,12 +54,16 @@ public sealed class ConvergeWait : IConvergeWait
         _cancellationToken = cancellationToken;
         _adaptiveConfig = adaptiveConfig;
         _currentConcurrency = maxConcurrency;
-        _semaphore = new SemaphoreSlim(maxConcurrency, maxConcurrency);
         _logger = logger;
+
+        // When adaptive config is provided, use its max as the semaphore limit
+        // so we can scale up beyond initial maxConcurrency if needed
+        _maxConcurrency = _adaptiveConfig?.MaxConcurrency ?? maxConcurrency;
+        _semaphore = new SemaphoreSlim(maxConcurrency, _maxConcurrency);
 
         if (_adaptiveConfig != null)
         {
-            _monitorTask = Task.Run(() => MonitorCpuLoadAsync(), _internalCts.Token);
+            _monitorTask = Task.Run(MonitorCpuLoadAsync, _internalCts.Token);
         }
     }
 
@@ -100,7 +106,7 @@ public sealed class ConvergeWait : IConvergeWait
                             break;
                         }
 
-                        await Task.Delay(_retryPolicy.RetryDelay, _cancellationToken).ConfigureAwait(false);
+                        await Task.Delay(_retryPolicy.EffectiveRetryDelay, _cancellationToken).ConfigureAwait(false);
                     }
                 }
             }
@@ -130,53 +136,106 @@ public sealed class ConvergeWait : IConvergeWait
         _internalCts.Cancel();
         if (_monitorTask != null) await _monitorTask.ConfigureAwait(false);
 
-        await _semaphore.WaitAsync().ConfigureAwait(false);
-        _semaphore.Release();
+        // Release any reserved slots before disposing
+        var reserved = Interlocked.Exchange(ref _reservedSlots, 0);
+        if (reserved > 0)
+        {
+            _semaphore.Release(reserved);
+        }
+
         _semaphore.Dispose();
         _internalCts.Dispose();
     }
 
     private async Task MonitorCpuLoadAsync()
-
     {
         var sw = Stopwatch.StartNew();
         var lastTotalCpu = Process.GetCurrentProcess().TotalProcessorTime;
 
-        while (!_internalCts.IsCancellationRequested)
+        try
         {
-            await Task.Delay(_adaptiveConfig!.SamplingInterval, _internalCts.Token).ConfigureAwait(false);
-
-            var nowTotalCpu = Process.GetCurrentProcess().TotalProcessorTime;
-            var deltaCpu = nowTotalCpu - lastTotalCpu;
-            lastTotalCpu = nowTotalCpu;
-
-            var elapsed = sw.Elapsed;
-            sw.Restart();
-
-            var cpuUsage = 100f *
-                           (float)(deltaCpu.TotalMilliseconds /
-                                   (Environment.ProcessorCount * elapsed.TotalMilliseconds));
-
-            var newConcurrency = _currentConcurrency;
-
-            if (cpuUsage < _adaptiveConfig.TargetCpuUsagePercent - 5 &&
-                _currentConcurrency < _adaptiveConfig.MaxConcurrency)
+            while (!_internalCts.IsCancellationRequested)
             {
-                newConcurrency++;
-            }
-            else if (cpuUsage > _adaptiveConfig.TargetCpuUsagePercent + 5 &&
-                     _currentConcurrency > _adaptiveConfig.MinConcurrency)
-            {
-                newConcurrency--;
-            }
+                await Task.Delay(_adaptiveConfig!.SamplingInterval, _internalCts.Token).ConfigureAwait(false);
 
-            if (newConcurrency != _currentConcurrency)
-            {
-                _currentConcurrency = newConcurrency;
-                OnConcurrencyChanged?.Invoke(_currentConcurrency);
-                _logger?.LogInformation("Concurrency adjusted to {Concurrency} due to CPU usage: {CpuUsage:F2}%",
-                    _currentConcurrency, cpuUsage);
+                var nowTotalCpu = Process.GetCurrentProcess().TotalProcessorTime;
+                var deltaCpu = nowTotalCpu - lastTotalCpu;
+                lastTotalCpu = nowTotalCpu;
+
+                var elapsed = sw.Elapsed;
+                sw.Restart();
+
+                var cpuUsage = 100f *
+                               (float)(deltaCpu.TotalMilliseconds /
+                                       (Environment.ProcessorCount * elapsed.TotalMilliseconds));
+
+                var newConcurrency = _currentConcurrency;
+
+                if (cpuUsage < _adaptiveConfig.TargetCpuUsagePercent - 5 &&
+                    _currentConcurrency < _adaptiveConfig.MaxConcurrency)
+                {
+                    newConcurrency++;
+                }
+                else if (cpuUsage > _adaptiveConfig.TargetCpuUsagePercent + 5 &&
+                         _currentConcurrency > _adaptiveConfig.MinConcurrency)
+                {
+                    newConcurrency--;
+                }
+
+                if (newConcurrency != _currentConcurrency)
+                {
+                    AdjustConcurrency(newConcurrency, cpuUsage);
+                }
             }
         }
+        catch (OperationCanceledException)
+        {
+            // Expected when disposing - exit gracefully
+        }
+    }
+
+    private void AdjustConcurrency(int newConcurrency, float cpuUsage)
+    {
+        var delta = newConcurrency - _currentConcurrency;
+
+        if (delta > 0)
+        {
+            // Scaling UP: release reserved slots or add new capacity
+            var toRelease = Math.Min(delta, _reservedSlots);
+            if (toRelease > 0)
+            {
+                _semaphore.Release(toRelease);
+                Interlocked.Add(ref _reservedSlots, -toRelease);
+            }
+
+            // If we need more capacity than reserved slots, release additional
+            var additional = delta - toRelease;
+            if (additional > 0 && _semaphore.CurrentCount + additional <= _maxConcurrency)
+            {
+                _semaphore.Release(additional);
+            }
+        }
+        else if (delta < 0)
+        {
+            // Scaling DOWN: acquire slots to hold them (non-blocking attempt)
+            var toAcquire = -delta;
+            for (var i = 0; i < toAcquire; i++)
+            {
+                if (_semaphore.Wait(0)) // Non-blocking acquire
+                {
+                    Interlocked.Increment(ref _reservedSlots);
+                }
+                else
+                {
+                    // Can't acquire immediately - will naturally throttle as tasks complete
+                    break;
+                }
+            }
+        }
+
+        _currentConcurrency = newConcurrency;
+        OnConcurrencyChanged?.Invoke(_currentConcurrency);
+        _logger?.LogInformation("Concurrency adjusted to {Concurrency} due to CPU usage: {CpuUsage:F2}%",
+            _currentConcurrency, cpuUsage);
     }
 }
