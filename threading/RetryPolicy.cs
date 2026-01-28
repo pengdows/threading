@@ -74,21 +74,13 @@ public record RetryPolicy(
     {
         var baseDelay = EffectiveRetryDelay;
         var factor = Math.Pow(BackoffMultiplier, attempt - 1);
-        var maxDelay = MaxDelay ?? TimeSpan.MaxValue;
-        var baseDelayMs = baseDelay.TotalMilliseconds;
-        var maxDelayMs = maxDelay.TotalMilliseconds;
-        var delayMs = baseDelayMs * factor;
+        var delay = TimeSpan.FromMilliseconds(baseDelay.TotalMilliseconds * factor);
 
-        if (double.IsNaN(delayMs) || double.IsInfinity(delayMs) || delayMs >= maxDelayMs)
+        if (MaxDelay.HasValue && delay > MaxDelay.Value)
         {
-            return maxDelay;
+            return MaxDelay.Value;
         }
 
-        if (delayMs <= 0)
-        {
-            return TimeSpan.Zero;
-        }
-
-        return TimeSpan.FromMilliseconds(delayMs);
+        return delay;
     }
 }

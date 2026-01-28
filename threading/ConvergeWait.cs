@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging;
 
 namespace pengdows.threading;
 
@@ -21,7 +21,6 @@ public sealed class ConvergeWait : IConvergeWait
     private readonly CancellationToken _cancellationToken;
     private readonly AdaptiveConfig? _adaptiveConfig;
     private readonly CancellationTokenSource _internalCts = new();
-    private readonly CancellationTokenSource _disposeCts = new();
     private readonly ILogger<ConvergeWait>? _logger;
     private readonly int _maxConcurrency;
 
@@ -30,6 +29,7 @@ public sealed class ConvergeWait : IConvergeWait
     private Task? _monitorTask;
     private RetryPolicy _retryPolicy = RetryPolicy.None;
     private int _totalCompleted;
+    private int _totalFailed;
     private int _totalQueued;
 
     public event Action<int>? OnQueued;
@@ -42,8 +42,8 @@ public sealed class ConvergeWait : IConvergeWait
 
     public int TotalCompleted => _totalCompleted;
 
-    public int TotalFailed => _exceptions.Count;
-    public bool HasFailures => _exceptions.Count > 0;
+    public int TotalFailed => _totalFailed;
+    public bool HasFailures => _totalFailed > 0;
     public IReadOnlyList<Exception> Exceptions => _exceptions.AsReadOnly();
     public double ProgressPercent
     {
@@ -56,7 +56,8 @@ public sealed class ConvergeWait : IConvergeWait
             }
 
             var completed = Volatile.Read(ref _totalCompleted);
-            var percent = (double)completed / queued * 100.0;
+            var failed = Volatile.Read(ref _totalFailed);
+            var percent = (double)(completed + failed) / queued * 100.0;
             return percent > 100.0 ? 100.0 : percent;
         }
     }
@@ -100,7 +101,26 @@ public sealed class ConvergeWait : IConvergeWait
             throw new ArgumentNullException(nameof(workItem));
         }
 
-        _ = QueueAsync(workItem, _cancellationToken);
+        var task = Task.Run(async () =>
+        {
+            await _semaphore.WaitAsync(_cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await ExecuteWithRetryAsync(workItem, _cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }, _cancellationToken);
+
+        lock (_lock)
+        {
+            _tasks.Add(task);
+            var queued = Interlocked.Increment(ref _totalQueued);
+            OnQueued?.Invoke(queued);
+            RaiseProgress();
+        }
     }
 
     public async Task QueueAsync(Func<Task> workItem, CancellationToken ct = default)
@@ -110,7 +130,7 @@ public sealed class ConvergeWait : IConvergeWait
             throw new ArgumentNullException(nameof(workItem));
         }
 
-        var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken, ct, _disposeCts.Token);
+        var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken, ct);
 
         try
         {
@@ -156,26 +176,10 @@ public sealed class ConvergeWait : IConvergeWait
 
     public async ValueTask DisposeAsync()
     {
-        _disposeCts.Cancel();
         _internalCts.Cancel();
         if (_monitorTask != null)
         {
             await _monitorTask.ConfigureAwait(false);
-        }
-
-        Task[] snapshot;
-        lock (_lock)
-        {
-            snapshot = _tasks.ToArray();
-        }
-
-        try
-        {
-            await Task.WhenAll(snapshot).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogDebug(ex, "Suppressing task exceptions during dispose.");
         }
 
         // Release any reserved slots before disposing
@@ -186,7 +190,6 @@ public sealed class ConvergeWait : IConvergeWait
         }
 
         _semaphore.Dispose();
-        _disposeCts.Dispose();
         _internalCts.Dispose();
     }
 
@@ -314,6 +317,7 @@ public sealed class ConvergeWait : IConvergeWait
                         _exceptions.Add(ex);
                     }
 
+                    Interlocked.Increment(ref _totalFailed);
                     OnError?.Invoke(ex);
                     _logger?.LogError(ex, "Task failed permanently after {Attempts} attempts", attempts);
                     RaiseProgress();
