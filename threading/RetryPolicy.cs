@@ -3,7 +3,7 @@ namespace pengdows.threading;
 /// <summary>
 /// Configures retry behavior for failed tasks.
 /// </summary>
-/// <param name="Mode">The retry mode (None or RetryXTimes).</param>
+/// <param name="Mode">The retry mode (None, RetryXTimes, or ExponentialBackoff).</param>
 /// <param name="MaxRetries">Maximum number of retry attempts (default: 3).</param>
 /// <param name="RetryDelay">Delay between retry attempts (default: 100ms).</param>
 /// <param name="MaxDelay">Maximum delay for exponential backoff (optional).</param>
@@ -74,7 +74,14 @@ public record RetryPolicy(
     {
         var baseDelay = EffectiveRetryDelay;
         var factor = Math.Pow(BackoffMultiplier, attempt - 1);
-        var delay = TimeSpan.FromMilliseconds(baseDelay.TotalMilliseconds * factor);
+        var delayMs = baseDelay.TotalMilliseconds * factor;
+
+        if (double.IsInfinity(delayMs) || double.IsNaN(delayMs) || delayMs > TimeSpan.MaxValue.TotalMilliseconds)
+        {
+            return MaxDelay ?? TimeSpan.MaxValue;
+        }
+
+        var delay = TimeSpan.FromMilliseconds(delayMs);
 
         if (MaxDelay.HasValue && delay > MaxDelay.Value)
         {

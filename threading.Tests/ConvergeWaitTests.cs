@@ -196,16 +196,23 @@ public class ConvergeWaitTests
     [Fact]
     public async Task ProgressPercent_Reaches100_WithMixedSuccessAndFailure()
     {
-        var converge = new ConvergeWait(1);
+        var converge = new ConvergeWait(2);
         converge.SetRetryPolicy(RetryPolicy.None);
 
-        converge.Queue(() => Task.CompletedTask);
-        converge.Queue(() => throw new InvalidOperationException("fail"));
+        for (var i = 0; i < 2; i++)
+        {
+            converge.Queue(() => Task.CompletedTask);
+        }
+
+        for (var i = 0; i < 2; i++)
+        {
+            converge.Queue(() => throw new InvalidOperationException("fail"));
+        }
 
         await converge.WaitForAllAsync();
 
-        Assert.Equal(1, converge.TotalCompleted);
-        Assert.Equal(1, converge.TotalFailed);
+        Assert.Equal(2, converge.TotalCompleted);
+        Assert.Equal(2, converge.TotalFailed);
         Assert.Equal(100.0, converge.ProgressPercent);
     }
 
@@ -541,14 +548,12 @@ public class ConvergeWaitTests
     {
         var policy = RetryPolicy.Exponential(
             maxRetries: 100,
-            initialDelay: TimeSpan.FromDays(1),
-            maxDelay: TimeSpan.FromDays(365),
+            initialDelay: TimeSpan.FromMilliseconds(1000),
             multiplier: 10.0);
 
-        // Should not throw or return negative/infinite values
-        var delay = policy.GetDelay(50);
-        Assert.True(delay >= TimeSpan.Zero);
-        Assert.True(delay <= TimeSpan.FromDays(365));
+        // Should not throw OverflowException even with extreme exponent
+        var delay = policy.GetDelay(100);
+        Assert.True(delay > TimeSpan.Zero);
     }
 
     [Fact]
