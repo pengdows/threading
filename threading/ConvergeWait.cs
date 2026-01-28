@@ -21,6 +21,7 @@ public sealed class ConvergeWait : IConvergeWait
     private readonly CancellationToken _cancellationToken;
     private readonly AdaptiveConfig? _adaptiveConfig;
     private readonly CancellationTokenSource _internalCts = new();
+    private readonly CancellationTokenSource _disposeCts = new();
     private readonly ILogger<ConvergeWait>? _logger;
     private readonly int _maxConcurrency;
 
@@ -35,6 +36,7 @@ public sealed class ConvergeWait : IConvergeWait
     public event Action<int>? OnCompleted;
     public event Action<Exception>? OnError;
     public event Action<int>? OnConcurrencyChanged;
+    public event Action<double>? OnProgress;
 
     public int TotalQueued => _totalQueued;
 
@@ -43,13 +45,31 @@ public sealed class ConvergeWait : IConvergeWait
     public int TotalFailed => _exceptions.Count;
     public bool HasFailures => _exceptions.Count > 0;
     public IReadOnlyList<Exception> Exceptions => _exceptions.AsReadOnly();
+    public double ProgressPercent
+    {
+        get
+        {
+            var queued = Volatile.Read(ref _totalQueued);
+            if (queued <= 0)
+            {
+                return 0;
+            }
+
+            var completed = Volatile.Read(ref _totalCompleted);
+            var percent = (double)completed / queued * 100.0;
+            return percent > 100.0 ? 100.0 : percent;
+        }
+    }
 
     public ConvergeWait(int maxConcurrency,
         AdaptiveConfig? adaptiveConfig = null,
         CancellationToken cancellationToken = default,
         ILogger<ConvergeWait>? logger = null)
     {
-        if (maxConcurrency < 1) throw new ArgumentOutOfRangeException(nameof(maxConcurrency));
+        if (maxConcurrency < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxConcurrency));
+        }
 
         _cancellationToken = cancellationToken;
         _adaptiveConfig = adaptiveConfig;
@@ -75,66 +95,88 @@ public sealed class ConvergeWait : IConvergeWait
 
     public void Queue(Func<Task> workItem)
     {
-        if (workItem == null) throw new ArgumentNullException(nameof(workItem));
+        if (workItem == null)
+        {
+            throw new ArgumentNullException(nameof(workItem));
+        }
+
+        _ = QueueAsync(workItem, _cancellationToken);
+    }
+
+    public async Task QueueAsync(Func<Task> workItem, CancellationToken ct = default)
+    {
+        if (workItem == null)
+        {
+            throw new ArgumentNullException(nameof(workItem));
+        }
+
+        var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken, ct, _disposeCts.Token);
+
+        try
+        {
+            await _semaphore.WaitAsync(linkedCts.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            linkedCts.Dispose();
+            throw;
+        }
 
         var task = Task.Run(async () =>
         {
-            await _semaphore.WaitAsync(_cancellationToken).ConfigureAwait(false);
             try
             {
-                var attempts = 0;
-                while (true)
-                {
-                    try
-                    {
-                        await workItem().ConfigureAwait(false);
-                        var completed = Interlocked.Increment(ref _totalCompleted);
-                        OnCompleted?.Invoke(completed);
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        attempts++;
-                        _logger?.LogWarning(ex, "Task attempt {Attempt} failed", attempts);
-
-                        if (_retryPolicy.Mode == RetryMode.None ||
-                            (_retryPolicy.Mode == RetryMode.RetryXTimes && attempts > _retryPolicy.MaxRetries))
-                        {
-                            lock (_lock) _exceptions.Add(ex);
-                            OnError?.Invoke(ex);
-                            _logger?.LogError(ex, "Task failed permanently after {Attempts} attempts", attempts);
-                            break;
-                        }
-
-                        await Task.Delay(_retryPolicy.EffectiveRetryDelay, _cancellationToken).ConfigureAwait(false);
-                    }
-                }
+                await ExecuteWithRetryAsync(workItem, linkedCts.Token).ConfigureAwait(false);
             }
             finally
             {
+                linkedCts.Dispose();
                 _semaphore.Release();
             }
-        }, _cancellationToken);
+        }, CancellationToken.None);
 
         lock (_lock)
         {
             _tasks.Add(task);
             var queued = Interlocked.Increment(ref _totalQueued);
             OnQueued?.Invoke(queued);
+            RaiseProgress();
         }
     }
 
     public async Task WaitForAllAsync()
     {
         Task[] snapshot;
-        lock (_lock) snapshot = _tasks.ToArray();
+        lock (_lock)
+        {
+            snapshot = _tasks.ToArray();
+        }
         await Task.WhenAll(snapshot).ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()
     {
+        _disposeCts.Cancel();
         _internalCts.Cancel();
-        if (_monitorTask != null) await _monitorTask.ConfigureAwait(false);
+        if (_monitorTask != null)
+        {
+            await _monitorTask.ConfigureAwait(false);
+        }
+
+        Task[] snapshot;
+        lock (_lock)
+        {
+            snapshot = _tasks.ToArray();
+        }
+
+        try
+        {
+            await Task.WhenAll(snapshot).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogDebug(ex, "Suppressing task exceptions during dispose.");
+        }
 
         // Release any reserved slots before disposing
         var reserved = Interlocked.Exchange(ref _reservedSlots, 0);
@@ -144,6 +186,7 @@ public sealed class ConvergeWait : IConvergeWait
         }
 
         _semaphore.Dispose();
+        _disposeCts.Dispose();
         _internalCts.Dispose();
     }
 
@@ -237,5 +280,53 @@ public sealed class ConvergeWait : IConvergeWait
         OnConcurrencyChanged?.Invoke(_currentConcurrency);
         _logger?.LogInformation("Concurrency adjusted to {Concurrency} due to CPU usage: {CpuUsage:F2}%",
             _currentConcurrency, cpuUsage);
+    }
+
+    private async Task ExecuteWithRetryAsync(Func<Task> workItem, CancellationToken ct)
+    {
+        for (var attempts = 0; ; )
+        {
+            try
+            {
+                await workItem().ConfigureAwait(false);
+                var completed = Interlocked.Increment(ref _totalCompleted);
+                OnCompleted?.Invoke(completed);
+                RaiseProgress();
+                return;
+            }
+            catch (Exception ex)
+            {
+                attempts++;
+                _logger?.LogWarning(ex, "Task attempt {Attempt} failed", attempts);
+
+                var shouldRetry = _retryPolicy.Mode switch
+                {
+                    RetryMode.None => false,
+                    RetryMode.RetryXTimes => attempts <= _retryPolicy.MaxRetries,
+                    RetryMode.ExponentialBackoff => attempts <= _retryPolicy.MaxRetries,
+                    _ => false
+                };
+
+                if (!shouldRetry)
+                {
+                    lock (_lock)
+                    {
+                        _exceptions.Add(ex);
+                    }
+
+                    OnError?.Invoke(ex);
+                    _logger?.LogError(ex, "Task failed permanently after {Attempts} attempts", attempts);
+                    RaiseProgress();
+                    return;
+                }
+
+                await Task.Delay(_retryPolicy.GetDelay(attempts), ct).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private void RaiseProgress()
+    {
+        OnProgress?.Invoke(ProgressPercent);
     }
 }

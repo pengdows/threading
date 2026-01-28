@@ -69,11 +69,13 @@ public class ConvergeWaitTests
         var converge = new ConvergeWait(4);
         var count = 0;
         for (var i = 0; i < 20; i++)
+        {
             converge.Queue(async () =>
             {
                 await Task.Delay(10);
                 Interlocked.Increment(ref count);
             });
+        }
         await converge.WaitForAllAsync();
         Assert.Equal(20, converge.TotalCompleted);
         Assert.Equal(20, count);
@@ -88,7 +90,10 @@ public class ConvergeWaitTests
         converge.Queue(() =>
         {
             attempts++;
-            if (attempts < 3) throw new InvalidOperationException("fail");
+            if (attempts < 3)
+            {
+                throw new InvalidOperationException("fail");
+            }
             return Task.CompletedTask;
         });
         await converge.WaitForAllAsync();
@@ -117,11 +122,111 @@ public class ConvergeWaitTests
         converge.OnCompleted += _ => completed++;
 
         for (var i = 0; i < 5; i++)
+        {
             converge.Queue(() => Task.CompletedTask);
+        }
 
         await converge.WaitForAllAsync();
         Assert.Equal(5, queued);
         Assert.Equal(5, completed);
+    }
+
+    [Fact]
+    public async Task QueueAsync_WaitsForBackpressure()
+    {
+        var converge = new ConvergeWait(1);
+        var firstStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await converge.QueueAsync(async () =>
+        {
+            firstStarted.SetResult(true);
+            await releaseFirst.Task;
+        });
+
+        await firstStarted.Task;
+
+        var secondQueued = converge.QueueAsync(() => Task.CompletedTask);
+        var completedTask = await Task.WhenAny(secondQueued, Task.Delay(50));
+        Assert.NotSame(secondQueued, completedTask);
+
+        releaseFirst.SetResult(true);
+        await secondQueued;
+        await converge.WaitForAllAsync();
+    }
+
+    [Fact]
+    public async Task QueueAsync_Cancellation_DoesNotLeakSemaphoreSlot()
+    {
+        var converge = new ConvergeWait(1);
+        converge.SetRetryPolicy(RetryPolicy.None);
+        using var cts = new CancellationTokenSource();
+
+        await converge.QueueAsync(async () =>
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cts.Token);
+        }, cts.Token);
+
+        cts.Cancel();
+
+        await converge.WaitForAllAsync();
+
+        await converge.QueueAsync(() => Task.CompletedTask);
+        await converge.WaitForAllAsync();
+
+        Assert.Equal(1, converge.TotalCompleted);
+        Assert.Equal(1, converge.TotalFailed);
+    }
+
+    [Fact]
+    public async Task QueueAsync_DisposeAsync_CancelsPendingQueue()
+    {
+        var converge = new ConvergeWait(1);
+        var releaseFirst = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await converge.QueueAsync(async () =>
+        {
+            await releaseFirst.Task;
+        });
+
+        var pendingQueue = converge.QueueAsync(() => Task.CompletedTask);
+        var disposeTask = converge.DisposeAsync().AsTask();
+
+        releaseFirst.SetResult(true);
+
+        await disposeTask;
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => pendingQueue);
+    }
+
+    [Fact]
+    public async Task ProgressPercent_Reaches100_OnSuccess()
+    {
+        var converge = new ConvergeWait(1);
+        var progressUpdates = new List<double>();
+        converge.OnProgress += value => progressUpdates.Add(value);
+
+        await converge.QueueAsync(() => Task.CompletedTask);
+        await converge.WaitForAllAsync();
+
+        Assert.True(progressUpdates.Count >= 2);
+        Assert.Equal(100.0, converge.ProgressPercent);
+        Assert.Equal(100.0, progressUpdates.Last());
+    }
+
+    [Fact]
+    public async Task OnProgress_Raises_OnFailure()
+    {
+        var converge = new ConvergeWait(1);
+        converge.SetRetryPolicy(RetryPolicy.None);
+        var progressUpdates = new List<double>();
+        converge.OnProgress += value => progressUpdates.Add(value);
+
+        await converge.QueueAsync(() => throw new InvalidOperationException("fail"));
+        await converge.WaitForAllAsync();
+
+        Assert.True(progressUpdates.Count >= 2);
+        Assert.Equal(1, converge.TotalFailed);
     }
 
     [Fact]
@@ -201,7 +306,9 @@ public class ConvergeWaitTests
         };
 
         for (var i = 0; i < 32; i++)
+        {
             converge.Queue(() => CpuTestHelper.BurnCpu(TimeSpan.FromSeconds(2)));
+        }
 
         await converge.WaitForAllAsync();
         Assert.NotEmpty(observedConcurrency);
@@ -312,7 +419,10 @@ public class ConvergeWaitTests
         var converge = new ConvergeWait(4, adaptiveConfig: adaptive, logger: NullLogger<ConvergeWait>.Instance);
         converge.OnConcurrencyChanged += c =>
         {
-            if (c < 4) scaleDownOccurred = true;
+            if (c < 4)
+            {
+                scaleDownOccurred = true;
+            }
         };
 
         // Act: Queue CPU-intensive tasks and track actual concurrency
@@ -324,9 +434,13 @@ public class ConvergeWaitTests
                 lock (lockObj)
                 {
                     if (concurrent > maxObservedConcurrent)
+                    {
                         maxObservedConcurrent = concurrent;
+                    }
                     if (scaleDownOccurred)
+                    {
                         concurrencyAfterScaleDown.Add(concurrent);
+                    }
                 }
 
                 // Burn CPU to trigger adaptive throttling
@@ -335,7 +449,9 @@ public class ConvergeWaitTests
                 {
                     double x = 0;
                     for (var j = 0; j < 10000; j++)
+                    {
                         x += Math.Sqrt(j);
+                    }
                 }
 
                 Interlocked.Decrement(ref currentConcurrent);
@@ -392,6 +508,54 @@ public class ConvergeWaitTests
     }
 
     [Fact]
+    public void RetryPolicy_ExponentialBackoff_IncreasesDelay()
+    {
+        var policy = RetryPolicy.Exponential(
+            maxRetries: 5,
+            initialDelay: TimeSpan.FromMilliseconds(100),
+            maxDelay: TimeSpan.FromMilliseconds(1000),
+            multiplier: 2.0);
+
+        var delay1 = policy.GetDelay(1);
+        var delay2 = policy.GetDelay(2);
+        var delay3 = policy.GetDelay(3);
+
+        Assert.Equal(TimeSpan.FromMilliseconds(100), delay1);
+        Assert.True(delay2 > delay1);
+        Assert.True(delay3 > delay2);
+    }
+
+    [Fact]
+    public void RetryPolicy_ExponentialBackoff_ClampsToMaxDelay()
+    {
+        var policy = RetryPolicy.Exponential(
+            maxRetries: 5,
+            initialDelay: TimeSpan.FromMilliseconds(200),
+            maxDelay: TimeSpan.FromMilliseconds(300),
+            multiplier: 3.0);
+
+        var delay1 = policy.GetDelay(1);
+        var delay2 = policy.GetDelay(2);
+
+        Assert.Equal(TimeSpan.FromMilliseconds(200), delay1);
+        Assert.Equal(TimeSpan.FromMilliseconds(300), delay2);
+    }
+
+    [Fact]
+    public void RetryPolicy_ExponentialBackoff_ClampsToTimeSpanMaxValue()
+    {
+        var policy = RetryPolicy.Exponential(
+            maxRetries: 5,
+            initialDelay: TimeSpan.FromDays(1),
+            maxDelay: null,
+            multiplier: double.MaxValue);
+
+        var delay = policy.GetDelay(2);
+
+        Assert.Equal(TimeSpan.MaxValue, delay);
+    }
+
+    [Fact]
     public async Task RetryPolicy_UsesEffectiveDelay_NotRawDelay()
     {
         // Arrange: Use record constructor with default delay (TimeSpan.Zero)
@@ -407,7 +571,10 @@ public class ConvergeWaitTests
         {
             attemptTimes.Add(DateTime.UtcNow);
             attempts++;
-            if (attempts < 3) throw new InvalidOperationException("fail");
+            if (attempts < 3)
+            {
+                throw new InvalidOperationException("fail");
+            }
             return Task.CompletedTask;
         });
 
@@ -428,6 +595,25 @@ public class ConvergeWaitTests
     }
 
     [Fact]
+    public async Task RetryPolicy_ZeroMaxRetries_DoesNotRetry()
+    {
+        var attempts = 0;
+        var converge = new ConvergeWait(1);
+        converge.SetRetryPolicy(new RetryPolicy(RetryMode.RetryXTimes, MaxRetries: 0));
+
+        converge.Queue(() =>
+        {
+            attempts++;
+            throw new InvalidOperationException("fail");
+        });
+
+        await converge.WaitForAllAsync();
+
+        Assert.Equal(1, attempts);
+        Assert.Equal(1, converge.TotalFailed);
+    }
+
+    [Fact]
     public async Task DisposeAsync_AfterAdaptiveScaleDown_ReleasesReservedSlots()
     {
         // Arrange: Create converge with adaptive that will scale down
@@ -442,7 +628,10 @@ public class ConvergeWaitTests
         var converge = new ConvergeWait(4, adaptiveConfig: adaptive, logger: NullLogger<ConvergeWait>.Instance);
         converge.OnConcurrencyChanged += c =>
         {
-            if (c < 4) scaleDownOccurred = true;
+            if (c < 4)
+            {
+                scaleDownOccurred = true;
+            }
         };
 
         // Queue enough CPU-intensive work to trigger scale down
