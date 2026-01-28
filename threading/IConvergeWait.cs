@@ -27,6 +27,11 @@ public interface IConvergeWait : IAsyncDisposable
     event Action<int>? OnConcurrencyChanged;
 
     /// <summary>
+    /// Raised when progress percentage changes. Parameter is the percent value (0-100).
+    /// </summary>
+    event Action<double>? OnProgress;
+
+    /// <summary>
     /// Total number of tasks that have been queued.
     /// </summary>
     int TotalQueued { get; }
@@ -52,6 +57,11 @@ public interface IConvergeWait : IAsyncDisposable
     IReadOnlyList<Exception> Exceptions { get; }
 
     /// <summary>
+    /// Percentage of completed tasks out of total queued (0-100).
+    /// </summary>
+    double ProgressPercent { get; }
+
+    /// <summary>
     /// Sets the retry policy for failed tasks.
     /// </summary>
     /// <param name="policy">The retry policy to apply to subsequent task failures.</param>
@@ -62,6 +72,13 @@ public interface IConvergeWait : IAsyncDisposable
     /// </summary>
     /// <param name="workItem">The async work to execute.</param>
     void Queue(Func<Task> workItem);
+
+    /// <summary>
+    /// Queues a task for execution asynchronously, waiting for a concurrency slot before scheduling.
+    /// </summary>
+    /// <param name="workItem">The async work to execute.</param>
+    /// <param name="ct">Cancellation token for the enqueue operation.</param>
+    Task QueueAsync(Func<Task> workItem, CancellationToken ct = default);
 
     /// <summary>
     /// Waits for all currently queued tasks to complete.
