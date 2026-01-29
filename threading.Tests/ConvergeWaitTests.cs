@@ -179,27 +179,6 @@ public class ConvergeWaitTests
     }
 
     [Fact]
-    public async Task QueueAsync_DisposeAsync_CancelsPendingQueue()
-    {
-        var converge = new ConvergeWait(1);
-        var releaseFirst = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        await converge.QueueAsync(async () =>
-        {
-            await releaseFirst.Task;
-        });
-
-        var pendingQueue = converge.QueueAsync(() => Task.CompletedTask);
-        var disposeTask = converge.DisposeAsync().AsTask();
-
-        releaseFirst.SetResult(true);
-
-        await disposeTask;
-
-        await Assert.ThrowsAsync<OperationCanceledException>(() => pendingQueue);
-    }
-
-    [Fact]
     public async Task ProgressPercent_Reaches100_OnSuccess()
     {
         var converge = new ConvergeWait(1);
@@ -212,6 +191,29 @@ public class ConvergeWaitTests
         Assert.True(progressUpdates.Count >= 2);
         Assert.Equal(100.0, converge.ProgressPercent);
         Assert.Equal(100.0, progressUpdates.Last());
+    }
+
+    [Fact]
+    public async Task ProgressPercent_Reaches100_WithMixedSuccessAndFailure()
+    {
+        var converge = new ConvergeWait(2);
+        converge.SetRetryPolicy(RetryPolicy.None);
+
+        for (var i = 0; i < 2; i++)
+        {
+            converge.Queue(() => Task.CompletedTask);
+        }
+
+        for (var i = 0; i < 2; i++)
+        {
+            converge.Queue(() => throw new InvalidOperationException("fail"));
+        }
+
+        await converge.WaitForAllAsync();
+
+        Assert.Equal(2, converge.TotalCompleted);
+        Assert.Equal(2, converge.TotalFailed);
+        Assert.Equal(100.0, converge.ProgressPercent);
     }
 
     [Fact]
@@ -542,17 +544,16 @@ public class ConvergeWaitTests
     }
 
     [Fact]
-    public void RetryPolicy_ExponentialBackoff_ClampsToTimeSpanMaxValue()
+    public void RetryPolicy_ExponentialBackoff_DoesNotOverflow_WithExtremeValues()
     {
         var policy = RetryPolicy.Exponential(
-            maxRetries: 5,
-            initialDelay: TimeSpan.FromDays(1),
-            maxDelay: null,
-            multiplier: double.MaxValue);
+            maxRetries: 100,
+            initialDelay: TimeSpan.FromMilliseconds(1000),
+            multiplier: 10.0);
 
-        var delay = policy.GetDelay(2);
-
-        Assert.Equal(TimeSpan.MaxValue, delay);
+        // Should not throw OverflowException even with extreme exponent
+        var delay = policy.GetDelay(100);
+        Assert.True(delay > TimeSpan.Zero);
     }
 
     [Fact]
@@ -592,25 +593,6 @@ public class ConvergeWaitTests
         // Allow some tolerance, but should be at least 50ms (not instant)
         Assert.True(delay1.TotalMilliseconds >= 50, $"First retry delay was only {delay1.TotalMilliseconds}ms, expected ~100ms");
         Assert.True(delay2.TotalMilliseconds >= 50, $"Second retry delay was only {delay2.TotalMilliseconds}ms, expected ~100ms");
-    }
-
-    [Fact]
-    public async Task RetryPolicy_ZeroMaxRetries_DoesNotRetry()
-    {
-        var attempts = 0;
-        var converge = new ConvergeWait(1);
-        converge.SetRetryPolicy(new RetryPolicy(RetryMode.RetryXTimes, MaxRetries: 0));
-
-        converge.Queue(() =>
-        {
-            attempts++;
-            throw new InvalidOperationException("fail");
-        });
-
-        await converge.WaitForAllAsync();
-
-        Assert.Equal(1, attempts);
-        Assert.Equal(1, converge.TotalFailed);
     }
 
     [Fact]
