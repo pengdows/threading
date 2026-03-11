@@ -169,13 +169,15 @@ public class ConvergeWaitTests
 
         cts.Cancel();
 
-        await converge.WaitForAllAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => converge.WaitForAllAsync());
 
         await converge.QueueAsync(() => Task.CompletedTask);
         await converge.WaitForAllAsync();
 
         Assert.Equal(1, converge.TotalCompleted);
-        Assert.Equal(1, converge.TotalFailed);
+        Assert.Equal(0, converge.TotalFailed);
+        Assert.False(converge.HasFailures);
+        Assert.Empty(converge.Exceptions);
     }
 
     [Fact]
@@ -336,6 +338,57 @@ public class ConvergeWaitTests
     }
 
     [Fact]
+    public async Task DisposeAsync_Rejects_New_Queue_Work()
+    {
+        var converge = new ConvergeWait(1);
+
+        await converge.DisposeAsync();
+
+        Assert.Throws<ObjectDisposedException>(() => converge.Queue(() => Task.CompletedTask));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => converge.QueueAsync(() => Task.CompletedTask));
+    }
+
+    [Fact]
+    public async Task DisposeAsync_WhenQueuedWorkIsCanceled_StillTransitionsToDisposed()
+    {
+        using var cts = new CancellationTokenSource();
+        var converge = new ConvergeWait(1, cancellationToken: cts.Token);
+        converge.Queue(async () => await Task.Delay(Timeout.InfiniteTimeSpan, cts.Token));
+
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => converge.DisposeAsync().AsTask());
+
+        Assert.Throws<ObjectDisposedException>(() => converge.Queue(() => Task.CompletedTask));
+        await converge.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task DisposeAsync_Drains_Queued_Work_Before_Disposing()
+    {
+        var converge = new ConvergeWait(1);
+        var releaseFirst = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondCompleted = false;
+
+        converge.Queue(async () => await releaseFirst.Task);
+        converge.Queue(() =>
+        {
+            secondCompleted = true;
+            return Task.CompletedTask;
+        });
+
+        var disposeTask = converge.DisposeAsync().AsTask();
+        await Task.Delay(50);
+        Assert.False(disposeTask.IsCompleted, "DisposeAsync should wait for queued work to finish");
+
+        releaseFirst.SetResult(true);
+        await disposeTask;
+
+        Assert.True(secondCompleted, "Queued work should complete before disposal tears down resources");
+        Assert.Equal(2, converge.TotalCompleted);
+    }
+
+    [Fact]
     public async Task WaitForAllAsync_CalledMultipleTimes_Succeeds()
     {
         // Arrange
@@ -399,6 +452,59 @@ public class ConvergeWaitTests
         // Assert: All queued tasks should complete
         Assert.Equal(20, completedCount);
         Assert.Equal(20, converge.TotalCompleted);
+    }
+
+    [Fact]
+    public async Task OnCompleted_HandlerException_DoesNotCorruptTaskAccounting()
+    {
+        var converge = new ConvergeWait(1);
+        converge.OnCompleted += _ => throw new InvalidOperationException("observer failure");
+
+        converge.Queue(() => Task.CompletedTask);
+
+        await converge.WaitForAllAsync();
+
+        Assert.Equal(1, converge.TotalCompleted);
+        Assert.Equal(0, converge.TotalFailed);
+        Assert.False(converge.HasFailures);
+        Assert.Empty(converge.Exceptions);
+    }
+
+    [Fact]
+    public async Task OnError_HandlerException_DoesNotHideUnderlyingFailure()
+    {
+        var converge = new ConvergeWait(1);
+        converge.SetRetryPolicy(RetryPolicy.None);
+        converge.OnError += _ => throw new InvalidOperationException("observer failure");
+
+        converge.Queue(() => throw new ApplicationException("task failure"));
+
+        await converge.WaitForAllAsync();
+
+        Assert.Equal(0, converge.TotalCompleted);
+        Assert.Equal(1, converge.TotalFailed);
+        Assert.True(converge.HasFailures);
+        Assert.Single(converge.Exceptions);
+        Assert.IsType<ApplicationException>(converge.Exceptions[0]);
+    }
+
+    [Fact]
+    public async Task Exceptions_ReturnsSnapshot_NotLiveView()
+    {
+        var converge = new ConvergeWait(1);
+        converge.SetRetryPolicy(RetryPolicy.None);
+
+        converge.Queue(() => throw new InvalidOperationException("first"));
+        await converge.WaitForAllAsync();
+
+        var snapshot = converge.Exceptions;
+        Assert.Single(snapshot);
+
+        converge.Queue(() => throw new ApplicationException("second"));
+        await converge.WaitForAllAsync();
+
+        Assert.Single(snapshot);
+        Assert.Equal(2, converge.Exceptions.Count);
     }
 
     [Fact]

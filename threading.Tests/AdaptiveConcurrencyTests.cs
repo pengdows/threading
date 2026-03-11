@@ -8,6 +8,50 @@ namespace pengdows.threading.Tests;
 
 public class AdaptiveConcurrencyTests
 {
+    [Fact]
+    public void AdaptiveConfig_DefaultConstructor_UsesSafeDefaults()
+    {
+        var config = new AdaptiveConfig();
+
+        Assert.Equal(70f, config.TargetCpuUsagePercent);
+        Assert.Equal(1, config.MinConcurrency);
+        Assert.Equal(64, config.MaxConcurrency);
+        Assert.Equal(TimeSpan.FromSeconds(2), config.SamplingInterval);
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    public void AdaptiveConfig_InvalidSamplingInterval_Throws(int milliseconds)
+    {
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(() => new AdaptiveConfig(
+            SamplingInterval: TimeSpan.FromMilliseconds(milliseconds)));
+
+        Assert.Equal("SamplingInterval", ex.ParamName);
+    }
+
+    [Fact]
+    public void AdaptiveConfig_MinConcurrencyGreaterThanMax_Throws()
+    {
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(() => new AdaptiveConfig(
+            MinConcurrency: 5,
+            MaxConcurrency: 4));
+
+        Assert.Equal("MinConcurrency", ex.ParamName);
+    }
+
+    [Theory]
+    [InlineData(0f)]
+    [InlineData(100f)]
+    [InlineData(-10f)]
+    [InlineData(150f)]
+    public void AdaptiveConfig_InvalidCpuTarget_Throws(float targetCpuUsagePercent)
+    {
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(() => new AdaptiveConfig(
+            TargetCpuUsagePercent: targetCpuUsagePercent));
+
+        Assert.Equal("TargetCpuUsagePercent", ex.ParamName);
+    }
+
     //[Fact(Skip = "Long-running test, enable manually if needed")]
     [Fact]
     public async Task AdaptiveConcurrency_AdjustsConcurrencyUnderLoad()

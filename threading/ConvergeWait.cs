@@ -5,6 +5,7 @@ namespace pengdows.threading;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -24,7 +25,12 @@ public sealed class ConvergeWait : IConvergeWait
     private readonly ILogger<ConvergeWait>? _logger;
     private readonly int _maxConcurrency;
 
+    private const int DisposeStateActive = 0;
+    private const int DisposeStateDisposing = 1;
+    private const int DisposeStateDisposed = 2;
+
     private int _currentConcurrency;
+    private int _disposeState;
     private int _reservedSlots; // Slots held to reduce effective concurrency
     private Task? _monitorTask;
     private RetryPolicy _retryPolicy = RetryPolicy.None;
@@ -44,7 +50,16 @@ public sealed class ConvergeWait : IConvergeWait
 
     public int TotalFailed => _totalFailed;
     public bool HasFailures => _totalFailed > 0;
-    public IReadOnlyList<Exception> Exceptions => _exceptions.AsReadOnly();
+    public IReadOnlyList<Exception> Exceptions
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _exceptions.ToArray();
+            }
+        }
+    }
     public double ProgressPercent
     {
         get
@@ -101,26 +116,33 @@ public sealed class ConvergeWait : IConvergeWait
             throw new ArgumentNullException(nameof(workItem));
         }
 
-        var task = Task.Run(async () =>
-        {
-            await _semaphore.WaitAsync(_cancellationToken).ConfigureAwait(false);
-            try
-            {
-                await ExecuteWithRetryAsync(workItem, _cancellationToken).ConfigureAwait(false);
-            }
-            finally
-            {
-                _semaphore.Release();
-            }
-        }, _cancellationToken);
+        ThrowIfNotActive();
 
+        Task task;
+        int queued;
         lock (_lock)
         {
+            ThrowIfNotActive();
+
+            task = Task.Run(async () =>
+            {
+                await _semaphore.WaitAsync(_cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await ExecuteWithRetryAsync(workItem, _cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    _semaphore.Release();
+                }
+            }, _cancellationToken);
+
             _tasks.Add(task);
-            var queued = Interlocked.Increment(ref _totalQueued);
-            OnQueued?.Invoke(queued);
-            RaiseProgress();
+            queued = Interlocked.Increment(ref _totalQueued);
         }
+
+        InvokeObserver(OnQueued, queued, nameof(OnQueued));
+        RaiseProgress();
     }
 
     public async Task QueueAsync(Func<Task> workItem, CancellationToken ct = default)
@@ -129,6 +151,8 @@ public sealed class ConvergeWait : IConvergeWait
         {
             throw new ArgumentNullException(nameof(workItem));
         }
+
+        ThrowIfNotActive();
 
         var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken, ct);
 
@@ -142,26 +166,35 @@ public sealed class ConvergeWait : IConvergeWait
             throw;
         }
 
-        var task = Task.Run(async () =>
+        int queued;
+        lock (_lock)
         {
-            try
-            {
-                await ExecuteWithRetryAsync(workItem, linkedCts.Token).ConfigureAwait(false);
-            }
-            finally
+            if (Volatile.Read(ref _disposeState) != DisposeStateActive)
             {
                 linkedCts.Dispose();
                 _semaphore.Release();
+                throw new ObjectDisposedException(GetType().FullName);
             }
-        }, CancellationToken.None);
 
-        lock (_lock)
-        {
+            var task = Task.Run(async () =>
+            {
+                try
+                {
+                    await ExecuteWithRetryAsync(workItem, linkedCts.Token).ConfigureAwait(false);
+                }
+                finally
+                {
+                    linkedCts.Dispose();
+                    _semaphore.Release();
+                }
+            }, CancellationToken.None);
+
             _tasks.Add(task);
-            var queued = Interlocked.Increment(ref _totalQueued);
-            OnQueued?.Invoke(queued);
-            RaiseProgress();
+            queued = Interlocked.Increment(ref _totalQueued);
         }
+
+        InvokeObserver(OnQueued, queued, nameof(OnQueued));
+        RaiseProgress();
     }
 
     public async Task WaitForAllAsync()
@@ -171,11 +204,23 @@ public sealed class ConvergeWait : IConvergeWait
         {
             snapshot = _tasks.ToArray();
         }
-        await Task.WhenAll(snapshot).ConfigureAwait(false);
+        try
+        {
+            await Task.WhenAll(snapshot).ConfigureAwait(false);
+        }
+        finally
+        {
+            PruneCompletedTasks();
+        }
     }
 
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.CompareExchange(ref _disposeState, DisposeStateDisposing, DisposeStateActive) != DisposeStateActive)
+        {
+            return;
+        }
+
         _internalCts.Cancel();
         if (_monitorTask != null)
         {
@@ -189,8 +234,35 @@ public sealed class ConvergeWait : IConvergeWait
             _semaphore.Release(reserved);
         }
 
-        _semaphore.Dispose();
-        _internalCts.Dispose();
+        ExceptionDispatchInfo? capturedException = null;
+
+        try
+        {
+            Task[] snapshot;
+            lock (_lock)
+            {
+                snapshot = _tasks.ToArray();
+            }
+
+            await Task.WhenAll(snapshot).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            capturedException = ExceptionDispatchInfo.Capture(ex);
+        }
+        finally
+        {
+            lock (_lock)
+            {
+                _tasks.Clear();
+            }
+
+            _semaphore.Dispose();
+            _internalCts.Dispose();
+            Volatile.Write(ref _disposeState, DisposeStateDisposed);
+        }
+
+        capturedException?.Throw();
     }
 
     private async Task MonitorCpuLoadAsync()
@@ -280,7 +352,7 @@ public sealed class ConvergeWait : IConvergeWait
         }
 
         _currentConcurrency = newConcurrency;
-        OnConcurrencyChanged?.Invoke(_currentConcurrency);
+        InvokeObserver(OnConcurrencyChanged, _currentConcurrency, nameof(OnConcurrencyChanged));
         _logger?.LogInformation("Concurrency adjusted to {Concurrency} due to CPU usage: {CpuUsage:F2}%",
             _currentConcurrency, cpuUsage);
     }
@@ -293,9 +365,13 @@ public sealed class ConvergeWait : IConvergeWait
             {
                 await workItem().ConfigureAwait(false);
                 var completed = Interlocked.Increment(ref _totalCompleted);
-                OnCompleted?.Invoke(completed);
+                InvokeObserver(OnCompleted, completed, nameof(OnCompleted));
                 RaiseProgress();
                 return;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -318,7 +394,7 @@ public sealed class ConvergeWait : IConvergeWait
                     }
 
                     Interlocked.Increment(ref _totalFailed);
-                    OnError?.Invoke(ex);
+                    InvokeObserver(OnError, ex, nameof(OnError));
                     _logger?.LogError(ex, "Task failed permanently after {Attempts} attempts", attempts);
                     RaiseProgress();
                     return;
@@ -331,6 +407,42 @@ public sealed class ConvergeWait : IConvergeWait
 
     private void RaiseProgress()
     {
-        OnProgress?.Invoke(ProgressPercent);
+        InvokeObserver(OnProgress, ProgressPercent, nameof(OnProgress));
+    }
+
+    private void ThrowIfNotActive()
+    {
+        if (Volatile.Read(ref _disposeState) != DisposeStateActive)
+        {
+            throw new ObjectDisposedException(GetType().FullName);
+        }
+    }
+
+    private void PruneCompletedTasks()
+    {
+        lock (_lock)
+        {
+            _tasks.RemoveAll(static task => task.IsCompleted);
+        }
+    }
+
+    private void InvokeObserver<T>(Action<T>? observer, T value, string eventName)
+    {
+        if (observer == null)
+        {
+            return;
+        }
+
+        foreach (Action<T> handler in observer.GetInvocationList())
+        {
+            try
+            {
+                handler(value);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "Observer {EventName} failed", eventName);
+            }
+        }
     }
 }
