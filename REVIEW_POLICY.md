@@ -1,6 +1,10 @@
 # REVIEW_POLICY.md (canonical)
 
-Use this as the single source of truth for Claude/Codex/Gemini/Copilot reviews.
+Use this as the single source of truth for Claude/Codex/Gemini/Copilot reviews of **pengdows.threading**
+(the `ConvergeWait` task-coordination library — bounded concurrency, adaptive throttling, retry,
+and convergence waiting). This policy is scoped to this repository's actual domain
+(concurrency/async correctness), not a generic template — do not reintroduce
+database/ORM-specific rules from other pengdows projects (e.g. `pengdows.crud`) here.
 
 ---
 
@@ -23,7 +27,7 @@ Every review must output, in this order:
 3. **Majors (P1)** — should fix before merge; waivers only for confirmed false positives
 4. **Minors (P2)** — optional/nits
 5. **Missing evidence** — tests/profiling/threat note required
-6. **DB impact notes** — only if SQL/dialect/DDL/transaction behavior changed
+6. **Concurrency impact notes** — only if semaphore permit accounting, cancellation semantics, or disposal/convergence ordering changed
 7. **Minimal patch guidance** — concrete steps, no handwaving
 8. **Confidence:** HIGH / MEDIUM / LOW
    * **HIGH** — directly evidenced by diff or tests
@@ -36,13 +40,13 @@ Every review must output, in this order:
 
 These are not checklist items — they are the lens through which every finding is evaluated.
 
-**The Boundary Rule** — Systems fail at boundaries. Every boundary must be explicit and controlled: DB connections, thread pools, network calls, memory ownership, authentication context. A change that makes a boundary implicit or uncontrolled is a defect regardless of whether it manifests immediately.
+**The Boundary Rule** — Systems fail at boundaries. Every boundary must be explicit and controlled: thread-pool admission, cancellation propagation, semaphore permit ownership, task lifetime. A change that makes a boundary implicit or uncontrolled is a defect regardless of whether it manifests immediately.
 
-**The Lampson Rule** — Ownership must be explicit. Every resource must have a single clear owner: connections, readers, transactions, memory, and execution contexts. Shared resources without explicit ownership eventually leak, corrupt state, or deadlock. Ask: who owns this resource? Who releases it? Can ownership escape the scope where it is controlled? Can two components believe they own it? If the answer is unclear, the design is wrong. *(Lampson, Hints for Computer System Design, 1983.)*
+**The Lampson Rule** — Ownership must be explicit. Every resource must have a single clear owner: `SemaphoreSlim` permits, `CancellationTokenSource` instances, tracked `Task`s. Shared resources without explicit ownership eventually leak, corrupt state, or deadlock. Ask: who owns this resource? Who releases it? Can ownership escape the scope where it is controlled? Can two components believe they own it? If the answer is unclear, the design is wrong. *(Lampson, Hints for Computer System Design, 1983.)*
 
-**The Abrash Rule** — Know what the machine is actually doing. If it looks simple and cheap, verify that it actually is. Optimization by belief is forbidden. Hidden costs are design defects.
+**The Abrash Rule** — Know what the machine is actually doing. If it looks simple and cheap, verify that it actually is. A synchronous `SemaphoreSlim.Wait(0)` "opportunistic acquire" looks cheap but can be structurally unwinnable under real backlog — `Release()` always favors an already-registered async waiter over a fresh synchronous poller. Optimization or throttling logic built on an assumption like that must be verified against real contention, not just read as plausible. Hidden costs are design defects.
 
-**The Schneier Rule** — Assume hostile inputs at every trust boundary. Fail loudly — silent failure is a security defect. Secrets must never appear in logs, exceptions, metrics, or telemetry.
+**The Schneier Rule** — Assume hostile inputs at every trust boundary (caller-supplied delegates, tokens, retry/backoff configuration). Fail loudly — silent failure is a defect. An observer/event-handler exception must never be discarded with zero observability just because no logger was configured.
 
 **The Holub/Martin Rule** — If it is hard to test, the design is wrong. Complexity is the enemy. Favor small, cohesive units whose behavior is easy to reason about and verify.
 
@@ -55,7 +59,7 @@ These are not checklist items — they are the lens through which every finding 
 ### A. Tests (TDD enforcement)
 
 * Any new behavior or bug fix **must include unit tests**.
-* Any change affecting DB behavior, SQL generation, transactions, pooling, or dialects **must include integration coverage**.
+* Any change affecting `WaitForAllAsync`/`DisposeAsync` convergence guarantees, semaphore permit accounting, or cancellation propagation **must include a test that exercises real concurrent contention**, not just a single-threaded happy path.
 * No skipped tests.
 * **Block if** behavior changed but tests did not change.
 
@@ -63,128 +67,96 @@ These are not checklist items — they are the lens through which every finding 
 
 Block if any of these occur:
 
-* Unvalidated input crosses a trust boundary (SQL, file paths, serialization, network calls, logging, connection strings).
-* Authentication/authorization logic changes without explicit tests.
-* Secrets or sensitive values can appear in logs, exceptions, metrics, or telemetry.
-* Custom crypto/token schemes introduced or modified without clear invariants and tests.
-* A failure path is silent — swallowed exceptions, unchecked return codes, or missing error logging are security defects, not merely quality issues.
-* A boundary (connection, pool, auth context, thread) becomes implicit or uncontrolled.
+* Unvalidated input crosses a trust boundary (e.g. a caller-supplied `RetryPolicy`/`AdaptiveConfig` value that can drive an unbounded delay, a negative delay, or an invalid concurrency bound).
+* A failure path is silent — swallowed exceptions, unchecked return codes, or missing error logging are defects, not merely quality issues. This includes event/observer handler exceptions: they must be surfaced (logged, traced, or otherwise observable) even when no `ILogger` was supplied.
+* A boundary (semaphore permit, cancellation token, task lifetime) becomes implicit or uncontrolled.
 
 ### C. Performance evidence (Abrash rule)
 
-* If PR claims perf improvement, includes optimization, or touches known hot paths in a way that could affect runtime cost: require evidence.
-  * Acceptable evidence: BenchmarkDotNet output, profiler summary, or before/after timing numbers.
-  * Benchmarks must demonstrate correct warmup methodology. Cold-path and steady-state results must be distinguished where relevant.
-  * Microbenchmarks must isolate the code under test. Benchmarking a surrounding pipeline is not acceptable evidence.
-  * The measured delta must exceed the noise floor — overlapping confidence intervals is not evidence.
-* Block "optimization by belief."
-* Block "it looks simple and cheap therefore it is" reasoning without verification.
+* If a PR claims a throttling/scheduling improvement or touches the adaptive-concurrency hot path: require evidence that it actually changes enforced concurrency under real contention, not just that it changes reported state (`_currentConcurrency`, `OnConcurrencyChanged`). A mechanism that "reports" a change without a semaphore permit ever actually being withheld is not evidence of anything.
+* Block "optimization by belief" and "it looks simple and cheap therefore it is" reasoning without verification.
 
-### D. API contract safety (interface-first)
+### D. Public API contract safety
 
-* Public API surface must remain stable unless explicitly intended.
-* All public APIs live in `pengdows.crud.abstractions`.
-* Concrete types must not cross module or service boundaries where an interface exists.
-* Changes to interfaces require baseline verification updates.
+* `IConvergeWait`'s public surface must remain stable unless the change is explicitly intended as a breaking change.
+* Concrete types (`ConvergeWait`, `AdaptiveConfig`, `RetryPolicy`) should be usable entirely through `IConvergeWait` where an interface exists; avoid leaking implementation details into the public contract.
+* A `record`'s constructor validation must not be bypassable via a `with` expression — if a type has invariants, either validate in every `init` accessor or make the properties construction-only (`get;` with no `init`/`set`).
 
 ### E. Resource lifetime violations
 
 Block if:
 
-* `DbConnection` lifetime escapes execution scope.
-* `IDataReader` / `ITrackedReader` is not deterministically disposed.
-* Transactions are stored in long-lived fields.
-* Async paths allow connection or reader leaks.
+* A `CancellationTokenSource` is disposed while something may still be observing its token, or is never disposed on any code path.
+* A `SemaphoreSlim` permit acquired by one code path is not guaranteed to be released or explicitly, deliberately withheld (reservation accounting) on every subsequent path, including exception paths.
+* `WaitForAllAsync`/`DisposeAsync` can return before every unit of work it is responsible for has reached a terminal state, under concurrent producers or concurrent callers.
+* `DisposeAsync` called concurrently from multiple callers behaves inconsistently (e.g. a non-owning caller returning before the actual disposal work completes).
 
-Resource leaks are architecture violations, not just bugs. The entire pool governance design exists to prevent this class of failure.
+Leaks and premature-return-before-convergence are architecture violations here, not just bugs — the entire reason this library exists is to make that guarantee actually hold.
 
 ### F. Project hard bans
 
-These rules are not stylistic preferences. They exist because violations create conditions where correctness defects become invisible in diffs, debugging sessions, and code review. They are therefore treated as correctness safeguards and enforced as P0 blockers.
+* **One statement per line, always.** `if (something) break;` on one line is forbidden — it is invisible in a diff and makes debugger breakpoints ambiguous.
+* **Braces are required for all control flow blocks without exception.**
+* **After any scope-exiting statement — `return`, `break`, `continue`, or `throw` — do not use `else`.**
+* **Parentheses must make expression intent explicit.** `(a && b) || c` is required; `a && b || c` is not acceptable.
+* **No fire-and-forget `Task.Run` whose exceptions are never observed** by an owning tracked-task list, an event, or an explicit log — an unobserved faulted task is a silent failure.
 
-* **TransactionScope is forbidden** — use `BeginTransaction`.
-* No string interpolation for SQL values.
-* No unquoted identifiers in custom SQL — use `WrapObjectName`.
-* **One statement per line, always.** `if (something) break;` on one line is forbidden. The break is invisible in a diff and makes debugger breakpoints ambiguous. This is how correctness defects hide.
-* **Braces are required for all control flow blocks without exception.** Brace-free single-line blocks are forbidden regardless of brevity. Braces and parentheses compile to nothing — file length is not a valid reason to omit them. An unbraced block is one added line away from a silent correctness bug.
-* **After any scope-exiting statement — `return`, `break`, `continue`, or `throw` — do not use `else`.** The else branch is already implied by the exit. An else after a scope exit is logically redundant and adds indentation that obscures control flow.
-* **Parentheses must make expression intent explicit.** Do not rely on operator precedence rules where parentheses would remove ambiguity. `(a && b) || c` is required; `a && b || c` is not acceptable.
+### G. Metrics/observability integrity
 
-### G. Metrics integrity
-
-* If behavior changes, verify that metrics still tell the truth.
-* A change that silently breaks a metric is equivalent to a change that breaks a query.
+* If behavior changes, verify that `TotalQueued`/`TotalCompleted`/`TotalFailed`/`ProgressPercent`/the `On*` events still tell the truth about what actually happened, not what was merely attempted or intended.
+* A change that silently breaks one of these is equivalent to a change that breaks a query.
 
 ### H. Correctness regressions
 
 Block if a change introduces any of the following:
 
-* Error paths that leave state inconsistent.
-* Retries that can duplicate side effects.
-* Exception handling that changes observable behavior without tests.
-* Logic changes that can produce incorrect results for valid, boundary, or adversarial inputs.
+* Error paths that leave `_tasks`, semaphore permit counts, or reservation-debt accounting inconsistent.
+* Retries that can duplicate side effects beyond what the caller's own `RetryPolicy` explicitly requested.
+* Exception handling that changes observable behavior (what ends up in `Exceptions`, what triggers `OnError`, what propagates from `WaitForAllAsync`/`DisposeAsync`) without tests.
+* Logic changes that can produce incorrect results for valid, boundary, or adversarial inputs (e.g. a negative `RetryPolicy.BackoffMultiplier`, `AdaptiveConfig.MaxConcurrency` less than the constructor's `maxConcurrency`).
 
 ---
 
 ## 5) P1 majors (fix or justify with false-positive evidence)
 
-### A. pengdows.crud core invariants
-
-* **ValueTask in hot paths** — execution methods return `ValueTask`/`ValueTask<T>`; do not regress to `Task`.
-* **No public constructors** on implementation types except `DatabaseContext`.
-* **Interface-first** — consumers depend on abstractions, not implementation types.
-* **TableGateway extension rule** — extend TableGateway; do not wrap it with service layers.
-* **[Id] vs [PrimaryKey]** — never apply both to the same property; preserve documented upsert key priority.
-
-### B. Function and method design (Holub/Martin)
+### A. Function and method design (Holub/Martin)
 
 * A function must do one conceptual thing. If a meaningful sub-operation obscures the main flow, extract it into a named function.
 * A function must be small enough to understand without losing the control flow in mental paging.
 * Parameter count should normally be fewer than four. When more are required, consider whether a parameter object, richer domain type, or decomposition is the correct resolution.
-* Constructor parameter count is a class responsibility signal. Many constructor dependencies usually indicate the class is doing too much or sitting at the wrong level of abstraction.
+* Constructor parameter count is a class responsibility signal.
 * Inheritance is a form of coupling. Flag new inheritance hierarchies where composition would serve.
 
-### C. Behavior locality (Holub)
+### B. Behavior locality (Holub)
 
-* Behavior must live with the structure that owns the data or invariant it manipulates.
-* Flag when business logic is implemented in service layers that simply wrap TableGateway calls.
-* Flag when SQL logic is implemented outside the gateway responsible for the table.
-* Flag "ask then act" patterns — code that retrieves state only to make decisions on it elsewhere. That decision belongs with the object that owns the state.
+* Behavior must live with the structure that owns the data or invariant it manipulates (e.g. permit-reservation accounting belongs inside `ConvergeWait`, not scattered across callers).
+* Flag "ask then act" patterns — code that retrieves state only to make decisions on it elsewhere.
 * Objects should expose capabilities, not data. Flag getters whose primary purpose is to allow outside code to enforce invariants that should live with the owning type. Do not flag simple data carriers, value objects, DTOs, or read models solely for exposing state.
 
-### D. Hidden cost violations (Abrash rule — extended)
+### C. Hidden cost violations (Abrash rule — extended)
 
-Flag methods that introduce hidden work not obvious from the call site: hidden allocations, implicit IO, hidden SQL generation, hidden blocking in async paths, or expensive LINQ pipelines.
+Flag methods that introduce hidden work not obvious from the call site: hidden allocations, hidden blocking in async paths (a synchronous `.Wait()`/`.Result` in an async path), or a "cheap-looking" non-blocking primitive (`SemaphoreSlim.Wait(0)`) used where it is actually unlikely to succeed under real load.
 
 Hidden cost violations are P1 unless they affect a known hot path or introduce blocking behavior in async code — in which case report them under P0 instead.
 
-### E. Deterministic resource ownership
+### D. Deterministic resource ownership
 
-* Dispose readers promptly — `ITrackedReader` is a lease.
-* No async leaks, no undisposed containers/readers/transactions.
-* No long-lived transactions stored as fields.
 * Every error path must be explicitly handled and tested — assume things will go wrong.
 * Never silently ignore errors.
+* No long-lived `CancellationTokenSource` or `SemaphoreSlim` stored without a clear disposal owner.
 
-### F. SQL correctness and multi-dialect awareness
-
-* Changes to dialects/SQL generation must consider: quoting rules, parameter marker rules, upsert behavior per DB, transaction/isolation semantics.
-* If a change risks a specific DB family, call it out and require a targeted integration test.
-* Do not represent the same SQL concept in two different ways simultaneously — duplicate dialect code paths are a correctness and maintenance hazard.
-
-### G. Move errors left
+### E. Move errors left
 
 * Move errors from runtime to compile time wherever possible.
 * Prefer type safety, compiler checks, and static guarantees over runtime validation when feasible.
 * If a design choice converts a compile-time guarantee into a runtime check, flag it.
 
-### H. Comments
+### F. Comments
 
 * Code must be understandable without comments. If a comment is needed, consider renaming or decomposing first.
-* A comment is only justified to explain something the code is structurally incapable of expressing — a known bug workaround, a regulatory constraint, a non-obvious invariant.
+* A comment is only justified to explain something the code is structurally incapable of expressing — a known bug workaround, a non-obvious invariant, a race the reader would otherwise "fix" incorrectly.
 * Bad comments are worse than no comments.
 * Ceremonial header comments are forbidden — authorship and change history belong in source control.
-* **Exception:** AI context headers are permitted where necessary to establish hot-path status or invariants that cannot be inferred from the diff alone.
 
 ---
 
@@ -201,38 +173,28 @@ Hidden cost violations are P1 unless they affect a known hot path or introduce b
 ### Tests
 
 * Unit tests for behavior changes.
-* Integration tests for DB-facing changes.
 * Regression tests for bug fixes.
-* Tests should primarily verify observable behavior, not internal implementation. Tests that assert internal method calls or internal structure instead of observable outcomes are fragile and should be flagged.
-* **Adversarial and boundary inputs are required** for any test touching string handling, identifier generation, SQL building, or type mapping.
-  * Make no assumptions about input size or content. Where a developer puts `"foo"`, a user will put `"supercalifragilisticexpialidocious"` — or a 64KB string, a null, a reserved word in one or more dialects, a string containing a parameter marker, a Unicode edge case, or a value at the boundary of the underlying type.
-  * Minimum bar: test with values that are longer, stranger, and more hostile than any example in the implementation.
+* Tests should primarily verify observable behavior (did every queued item actually converge? was a permit actually withheld or released?), not internal implementation details.
+* **Concurrent/adversarial scenarios are required** for anything touching `WaitForAllAsync`, `DisposeAsync`, `QueueAsync` admission, or adaptive scaling: concurrent producers while waiting, concurrent `DisposeAsync` callers, cancellation mid-wait, real contention (not just a single task) when asserting throttling behavior.
 * Test names must express intent. A well-named test is documentation that cannot go stale. `Test1` is not a test name.
 
 ### Performance
 
-Required when:
+Required when a PR claims a throttling/concurrency-limiting improvement:
 
-* PR claims perf improvement.
-* PR changes pooling, container execution, mapping, or dialect hot paths.
+* Evidence that enforced concurrency actually changed (e.g. an assertion on `SemaphoreSlim.CurrentCount` or observed concurrent execution count), not just that a reporting event fired.
+* Under real contention, not just an idle semaphore.
 
-Requirements:
+### Threat note (when applicable)
 
-* BenchmarkDotNet with correct warmup.
-* Cold-path and steady-state distinguished where relevant.
-* Microbenchmarks must isolate the code under test.
-* Delta must exceed noise floor.
-
-### Threat note (security changes)
-
-Required when touching: authn/authz, token handling, SQL building, deserialization, filesystem paths, logging, connection string handling.
+Required when touching: cancellation-token handling that crosses a trust boundary, logging of caller-supplied exception data, or any place a caller-supplied delegate's exception could otherwise be swallowed.
 
 Threat note format (5 bullets):
 
 * Entry points
 * Trust boundaries
-* Assets at risk
-* Attacker goals
+* Assets at risk (e.g. silent loss of queued work, unbounded delay/backoff, deadlock)
+* Attacker/misuse goals (what a malicious or merely careless caller could trigger)
 * Mitigations and tests
 
 ---
@@ -244,22 +206,22 @@ Threat note format (5 bullets):
 
 ---
 
-## 9) DB impact notes
+## 9) Concurrency impact notes
 
-If SQL/dialect behavior changes, reviewers must state:
+If a change touches semaphore permit accounting, cancellation propagation, or disposal/convergence ordering, reviewers must state:
 
-* Affected DBs (at least by family: Postgres-like, MySQL-like, SQL Server-like, embedded, warehouse)
-* Expected behavior differences
-* Which integration tests cover it, or what new test is required
+* What the enforced concurrency ceiling is before and after the change.
+* Whether `WaitForAllAsync`/`DisposeAsync` can still return before all in-scope work has reached a terminal state, under concurrent producers/callers.
+* Which tests cover it, or what new test is required.
 
 ---
 
 ## 10) Reviewer personas (how to think)
 
 * **Boundary:** Where does control transfer? Where does ownership transfer? Is every boundary explicit and controlled?
-* **Ownership:** Who owns this resource? Who releases it? Can ownership escape the scope where it is controlled? Can two components believe they own it?
-* **Security:** Assume hostile inputs. Insist on invariants and tests. Silence is failure. Secrets go nowhere.
-* **Runtime reality:** What does this actually do at runtime? Are there hidden allocations, blocking calls, implicit IO, or other invisible costs?
+* **Ownership:** Who owns this resource (permit, token, task)? Who releases it? Can ownership escape the scope where it is controlled? Can two components believe they own it?
+* **Security:** Assume hostile/careless inputs (bad `RetryPolicy`/`AdaptiveConfig` values). Insist on invariants and tests. Silence is failure.
+* **Runtime reality:** What does this actually do at runtime? Are there hidden allocations, blocking calls, or a "cheap" primitive that's actually racy under load?
 * **Behavior locality:** Does behavior live with the structure that owns the invariant? Are objects exposing capabilities or leaking data?
 * **Design/Testability:** If it is hard to test, the design is wrong.
 * **Clarity:** Code should read like an executable spec. One statement per line. Braces everywhere. Explicit parentheses. If you cannot say it in English, you cannot say it in code.
@@ -268,9 +230,11 @@ If SQL/dialect behavior changes, reviewers must state:
 
 ## Notes (repo-specific)
 
-This policy aligns with existing repo mandates:
-
-* TDD required, integration suite required, ValueTask hot paths, TransactionScope ban, interface-first, multi-dialect correctness constraints.
+This policy aligns with this repo's actual mandates (see `CLAUDE.md`): TDD required for every
+behavior/bug-fix/contract change, no skipped tests, and the central non-negotiable invariant
+that `WaitForAllAsync`/`DisposeAsync` must guarantee genuine convergence — everything queued
+actually completes before the caller continues — even under concurrent producers, concurrent
+waiters/disposers, and adaptive throttling.
 
 Influences: Abrash (measure everything, know the machine, expose hidden costs), Holub (behavior lives with the owning structure, design for testability, interfaces over concrete types), Lampson (explicit ownership, every resource has a single clear owner), Martin (small cohesive functions, single responsibility, clean contracts, dependency direction), Schneier (hostile inputs, explicit boundaries, fail loudly, secrets stay secret).
 
@@ -282,7 +246,4 @@ Compliance with this policy is enforced via:
 
 1. **GitHub PR Template (`.github/PULL_REQUEST_TEMPLATE.md`)**: Reminds contributors of the P0 hard-bans and required standards.
 2. **Copilot Instructions (`.github/copilot-instructions.md`)**: Configures GitHub Copilot Code Review to use this policy as its primary system prompt for PR analysis.
-3. **CI Checks (`.github/workflows/deploy.yml`)**: Automated `grep` checks in the build pipeline to catch P0 violations like `TransactionScope` usage before merge.
-4. **Manual Peer Review**: All PRs require approval from a maintainer who verifies adherence to this policy and project-specific invariants.
-
-
+3. **Manual Peer/AI Review**: Every PR requires review against this policy, including the concurrency-specific evidence in Section 7.

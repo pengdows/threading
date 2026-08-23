@@ -31,7 +31,9 @@ public sealed class ConvergeWait : IConvergeWait
 
     private int _currentConcurrency;
     private int _disposeState;
-    private int _reservedSlots; // Slots held to reduce effective concurrency
+    private int _reservedSlots; // Slots actually withheld to reduce effective concurrency
+    private int _pendingReservationDebt; // Slots the next completions still owe as withheld
+    private Task? _disposeTask;
     private Task? _monitorTask;
     private RetryPolicy _retryPolicy = RetryPolicy.None;
     private int _totalCompleted;
@@ -87,6 +89,12 @@ public sealed class ConvergeWait : IConvergeWait
             throw new ArgumentOutOfRangeException(nameof(maxConcurrency));
         }
 
+        if (adaptiveConfig != null && maxConcurrency > adaptiveConfig.MaxConcurrency)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxConcurrency),
+                "maxConcurrency cannot exceed adaptiveConfig.MaxConcurrency.");
+        }
+
         _cancellationToken = cancellationToken;
         _adaptiveConfig = adaptiveConfig;
         _currentConcurrency = maxConcurrency;
@@ -105,7 +113,7 @@ public sealed class ConvergeWait : IConvergeWait
 
     public void SetRetryPolicy(RetryPolicy policy)
     {
-        _retryPolicy = policy;
+        Volatile.Write(ref _retryPolicy, policy);
     }
 
 
@@ -133,7 +141,7 @@ public sealed class ConvergeWait : IConvergeWait
                 }
                 finally
                 {
-                    _semaphore.Release();
+                    ReleaseOrReserve();
                 }
             }, _cancellationToken);
 
@@ -156,14 +164,22 @@ public sealed class ConvergeWait : IConvergeWait
 
         var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken, ct);
 
-        try
+        // The admission wait (for a free concurrency slot) additionally observes _internalCts,
+        // which DisposeAsync cancels immediately. That way a call still waiting for a slot is
+        // canceled promptly instead of risking a hang against a semaphore DisposeAsync may go on
+        // to dispose while this call is still blocked. Once admitted, execution/retry below uses
+        // linkedCts alone, so an already-running item's retry backoff is unaffected by disposal.
+        using (var admissionCts = CancellationTokenSource.CreateLinkedTokenSource(linkedCts.Token, _internalCts.Token))
         {
-            await _semaphore.WaitAsync(linkedCts.Token).ConfigureAwait(false);
-        }
-        catch
-        {
-            linkedCts.Dispose();
-            throw;
+            try
+            {
+                await _semaphore.WaitAsync(admissionCts.Token).ConfigureAwait(false);
+            }
+            catch
+            {
+                linkedCts.Dispose();
+                throw;
+            }
         }
 
         int queued;
@@ -185,7 +201,7 @@ public sealed class ConvergeWait : IConvergeWait
                 finally
                 {
                     linkedCts.Dispose();
-                    _semaphore.Release();
+                    ReleaseOrReserve();
                 }
             }, CancellationToken.None);
 
@@ -199,35 +215,91 @@ public sealed class ConvergeWait : IConvergeWait
 
     public async Task WaitForAllAsync()
     {
-        Task[] snapshot;
-        lock (_lock)
+        // Loop until the task list is genuinely empty, not just until one snapshot drains.
+        // A single snapshot-and-await would let work queued by another thread mid-wait slip
+        // past unobserved, letting the caller resume before everything has converged.
+        while (true)
         {
-            snapshot = _tasks.ToArray();
-        }
-        try
-        {
-            await Task.WhenAll(snapshot).ConfigureAwait(false);
-        }
-        finally
-        {
-            PruneCompletedTasks();
+            Task[] snapshot;
+            lock (_lock)
+            {
+                snapshot = _tasks.ToArray();
+            }
+
+            if (snapshot.Length == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                await Task.WhenAll(snapshot).ConfigureAwait(false);
+            }
+            finally
+            {
+                PruneCompletedTasks();
+            }
+
+            lock (_lock)
+            {
+                if (_tasks.Count == 0)
+                {
+                    return;
+                }
+            }
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        if (Interlocked.CompareExchange(ref _disposeState, DisposeStateDisposing, DisposeStateActive) != DisposeStateActive)
+        Task disposeTask;
+        bool isOwner;
+        lock (_lock)
         {
-            return;
+            isOwner = _disposeTask == null;
+            if (isOwner)
+            {
+                _disposeState = DisposeStateDisposing;
+                _disposeTask = DisposeCoreAsync();
+            }
+
+            disposeTask = _disposeTask!;
         }
 
+        // Only the caller that actually triggered disposal observes its outcome (including any
+        // exception). Every other caller - whether joining concurrently or arriving after the
+        // fact - waits for that same completion but returns normally, matching the standard
+        // IAsyncDisposable expectation that calling DisposeAsync more than once is safe.
+        return isOwner ? new ValueTask(disposeTask) : new ValueTask(WaitWithoutObservingFaultAsync(disposeTask));
+    }
+
+    private static async Task WaitWithoutObservingFaultAsync(Task disposeTask)
+    {
+        try
+        {
+            await disposeTask.ConfigureAwait(false);
+        }
+        catch
+        {
+            // Intentionally swallowed - the owning caller already observed/threw this.
+        }
+    }
+
+    private async Task DisposeCoreAsync()
+    {
         _internalCts.Cancel();
         if (_monitorTask != null)
         {
             await _monitorTask.ConfigureAwait(false);
         }
 
-        // Release any reserved slots before disposing
+        // Cancel any outstanding reservation debt so the drain below can't stall: without this,
+        // a task completing during the drain could keep withholding its permit (honoring a
+        // stale throttling target) instead of releasing it to another task still waiting on
+        // admission, which could stop that task's Task.WhenAll from ever converging.
+        Interlocked.Exchange(ref _pendingReservationDebt, 0);
+
+        // Release any already-reserved slots before disposing
         var reserved = Interlocked.Exchange(ref _reservedSlots, 0);
         if (reserved > 0)
         {
@@ -318,43 +390,66 @@ public sealed class ConvergeWait : IConvergeWait
 
         if (delta > 0)
         {
-            // Scaling UP: release reserved slots or add new capacity
-            var toRelease = Math.Min(delta, _reservedSlots);
+            // Scaling UP: first cancel any outstanding reservation debt (slots promised to a
+            // prior scale-down that haven't been withheld yet), then release already-reserved
+            // slots, then inject new capacity if still short.
+            var remaining = delta;
+
+            var debt = Volatile.Read(ref _pendingReservationDebt);
+            if (debt > 0)
+            {
+                var toCancel = Math.Min(remaining, debt);
+                Interlocked.Add(ref _pendingReservationDebt, -toCancel);
+                remaining -= toCancel;
+            }
+
+            var toRelease = Math.Min(remaining, _reservedSlots);
             if (toRelease > 0)
             {
                 _semaphore.Release(toRelease);
                 Interlocked.Add(ref _reservedSlots, -toRelease);
+                remaining -= toRelease;
             }
 
-            // If we need more capacity than reserved slots, release additional
-            var additional = delta - toRelease;
-            if (additional > 0 && _semaphore.CurrentCount + additional <= _maxConcurrency)
+            if (remaining > 0 && _semaphore.CurrentCount + remaining <= _maxConcurrency)
             {
-                _semaphore.Release(additional);
+                _semaphore.Release(remaining);
             }
         }
         else if (delta < 0)
         {
-            // Scaling DOWN: acquire slots to hold them (non-blocking attempt)
-            var toAcquire = -delta;
-            for (var i = 0; i < toAcquire; i++)
-            {
-                if (_semaphore.Wait(0)) // Non-blocking acquire
-                {
-                    Interlocked.Increment(ref _reservedSlots);
-                }
-                else
-                {
-                    // Can't acquire immediately - will naturally throttle as tasks complete
-                    break;
-                }
-            }
+            // Scaling DOWN: record a reservation debt rather than racing a synchronous Wait(0)
+            // against the semaphore's own backlog of already-registered async waiters - a race
+            // SemaphoreSlim always resolves in the backlog's favor under real contention, which
+            // is exactly when scale-down matters most. The next `-delta` task completions each
+            // withhold their permit (see ReleaseOrReserve) instead of releasing it back to the
+            // pool, so the target is always deterministically reached, just not instantaneously.
+            Interlocked.Add(ref _pendingReservationDebt, -delta);
         }
 
         _currentConcurrency = newConcurrency;
         InvokeObserver(OnConcurrencyChanged, _currentConcurrency, nameof(OnConcurrencyChanged));
         _logger?.LogInformation("Concurrency adjusted to {Concurrency} due to CPU usage: {CpuUsage:F2}%",
             _currentConcurrency, cpuUsage);
+    }
+
+    private void ReleaseOrReserve()
+    {
+        while (true)
+        {
+            var debt = Volatile.Read(ref _pendingReservationDebt);
+            if (debt <= 0)
+            {
+                _semaphore.Release();
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref _pendingReservationDebt, debt - 1, debt) == debt)
+            {
+                Interlocked.Increment(ref _reservedSlots);
+                return;
+            }
+        }
     }
 
     private async Task ExecuteWithRetryAsync(Func<Task> workItem, CancellationToken ct)
@@ -378,11 +473,13 @@ public sealed class ConvergeWait : IConvergeWait
                 attempts++;
                 _logger?.LogWarning(ex, "Task attempt {Attempt} failed", attempts);
 
-                var shouldRetry = _retryPolicy.Mode switch
+                var retryPolicy = Volatile.Read(ref _retryPolicy);
+                var isFatal = ex is OutOfMemoryException or StackOverflowException;
+                var shouldRetry = !isFatal && retryPolicy.Mode switch
                 {
                     RetryMode.None => false,
-                    RetryMode.RetryXTimes => attempts <= _retryPolicy.MaxRetries,
-                    RetryMode.ExponentialBackoff => attempts <= _retryPolicy.MaxRetries,
+                    RetryMode.RetryXTimes => attempts <= retryPolicy.MaxRetries,
+                    RetryMode.ExponentialBackoff => attempts <= retryPolicy.MaxRetries,
                     _ => false
                 };
 
@@ -400,9 +497,22 @@ public sealed class ConvergeWait : IConvergeWait
                     return;
                 }
 
-                await Task.Delay(_retryPolicy.GetDelay(attempts), ct).ConfigureAwait(false);
+                await Task.Delay(retryPolicy.GetDelay(attempts), ct).ConfigureAwait(false);
             }
         }
+    }
+
+    internal int ReservedSlotsForTesting => _reservedSlots;
+
+    internal int PendingReservationDebtForTesting => _pendingReservationDebt;
+
+    internal int CurrentConcurrencyForTesting => _currentConcurrency;
+
+    internal int SemaphoreCurrentCountForTesting => _semaphore.CurrentCount;
+
+    internal void AdjustConcurrencyForTesting(int newConcurrency, float cpuUsage)
+    {
+        AdjustConcurrency(newConcurrency, cpuUsage);
     }
 
     private void RaiseProgress()
@@ -441,7 +551,16 @@ public sealed class ConvergeWait : IConvergeWait
             }
             catch (Exception ex)
             {
-                _logger?.LogWarning(ex, "Observer {EventName} failed", eventName);
+                // Fail loudly even when no logger was configured (the common case) - a
+                // subscriber's exception must never be discarded with zero observability.
+                if (_logger != null)
+                {
+                    _logger.LogWarning(ex, "Observer {EventName} failed", eventName);
+                }
+                else
+                {
+                    Trace.TraceWarning($"Observer {eventName} failed: {ex}");
+                }
             }
         }
     }

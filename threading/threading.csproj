@@ -19,10 +19,15 @@
         <PackageProjectUrl>https://github.com/pengdows/threading</PackageProjectUrl>
         <RepositoryUrl>https://github.com/pengdows/threading</RepositoryUrl>
         <RepositoryType>Github</RepositoryType>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
     </PropertyGroup>
 
     <ItemGroup>
       <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.4" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <None Include="..\docs\README.md" Pack="true" PackagePath="\" />
     </ItemGroup>
 
 </Project>

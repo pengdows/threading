@@ -1,6 +1,6 @@
 namespace pengdows.threading;
 
-public record AdaptiveConfig
+public sealed record AdaptiveConfig
 {
     public AdaptiveConfig(
         float TargetCpuUsagePercent = 70f,
@@ -41,13 +41,13 @@ public record AdaptiveConfig
             : SamplingInterval;
     }
 
-    public float TargetCpuUsagePercent { get; init; }
+    public float TargetCpuUsagePercent { get; }
 
-    public int MinConcurrency { get; init; }
+    public int MinConcurrency { get; }
 
-    public int MaxConcurrency { get; init; }
+    public int MaxConcurrency { get; }
 
-    public TimeSpan SamplingInterval { get; init; }
+    public TimeSpan SamplingInterval { get; }
 
     public static readonly AdaptiveConfig Default = new(
         TargetCpuUsagePercent: 70f,

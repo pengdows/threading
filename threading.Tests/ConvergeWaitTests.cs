@@ -740,4 +740,139 @@ public class ConvergeWaitTests
         Assert.True(scaleDownOccurred, "Adaptive throttling should have scaled down");
         Assert.True(completedInTime, "DisposeAsync should complete without deadlock even with reserved slots");
     }
+
+    [Fact]
+    public async Task DisposeAsync_CalledConcurrently_AllCallersWaitForCompletion()
+    {
+        var converge = new ConvergeWait(1);
+        var workStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        converge.Queue(async () =>
+        {
+            workStarted.SetResult(true);
+            await release.Task;
+        });
+
+        await workStarted.Task;
+
+        var dispose1 = converge.DisposeAsync().AsTask();
+        var dispose2 = converge.DisposeAsync().AsTask();
+
+        await Task.Delay(50);
+        Assert.False(dispose1.IsCompleted, "First DisposeAsync call should still be draining queued work");
+        Assert.False(dispose2.IsCompleted, "Second concurrent DisposeAsync call must wait for the same completion, not return early");
+
+        release.SetResult(true);
+
+        await Task.WhenAll(dispose1, dispose2);
+    }
+
+    [Fact]
+    public async Task QueueAsync_PendingDuringDispose_IsCanceledInsteadOfHanging()
+    {
+        var converge = new ConvergeWait(1);
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await converge.QueueAsync(async () => await release.Task);
+
+        var pendingQueue = converge.QueueAsync(() => Task.CompletedTask);
+
+        await Task.Delay(50);
+        Assert.False(pendingQueue.IsCompleted, "Second QueueAsync call should be blocked waiting for a concurrency slot");
+
+        var disposeTask = converge.DisposeAsync().AsTask();
+
+        var completed = await Task.WhenAny(pendingQueue, Task.Delay(2000));
+        Assert.Same(pendingQueue, completed);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pendingQueue);
+
+        release.SetResult(true);
+        await disposeTask;
+    }
+
+    [Fact]
+    public async Task WaitForAllAsync_IncludesWorkQueuedWhileWaiting()
+    {
+        var converge = new ConvergeWait(2);
+        var firstTaskRunning = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondCompleted = false;
+
+        converge.Queue(async () =>
+        {
+            firstTaskRunning.SetResult(true);
+            await releaseFirst.Task;
+        });
+
+        await firstTaskRunning.Task;
+
+        var waitTask = converge.WaitForAllAsync();
+
+        await Task.Delay(20); // give WaitForAllAsync time to take its snapshot
+        converge.Queue(async () =>
+        {
+            await Task.Delay(200);
+            secondCompleted = true;
+        });
+
+        releaseFirst.SetResult(true);
+
+        await waitTask;
+
+        Assert.True(secondCompleted, "WaitForAllAsync must not return before work queued during the wait also completes");
+    }
+
+    [Fact]
+    public void Constructor_MaxConcurrencyExceedsAdaptiveMax_ThrowsClearException()
+    {
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new ConvergeWait(10, new AdaptiveConfig(MaxConcurrency: 4)));
+
+        Assert.Equal("maxConcurrency", ex.ParamName);
+    }
+
+    [Theory]
+    [InlineData(typeof(OutOfMemoryException))]
+    [InlineData(typeof(StackOverflowException))]
+    public async Task Queue_FatalException_IsNeverRetried(Type exceptionType)
+    {
+        var attempts = 0;
+        var converge = new ConvergeWait(1);
+        converge.SetRetryPolicy(RetryPolicy.Retry(5));
+
+        converge.Queue(() =>
+        {
+            attempts++;
+            throw (Exception)Activator.CreateInstance(exceptionType)!;
+        });
+
+        await converge.WaitForAllAsync();
+
+        Assert.Equal(1, attempts);
+        Assert.Equal(1, converge.TotalFailed);
+        Assert.True(converge.HasFailures);
+    }
+
+    [Fact]
+    public async Task InvokeObserver_HandlerException_IsTracedWhenNoLoggerConfigured()
+    {
+        var listener = new TestTraceListener();
+        System.Diagnostics.Trace.Listeners.Add(listener);
+
+        try
+        {
+            var converge = new ConvergeWait(1);
+            converge.OnCompleted += _ => throw new InvalidOperationException("boom");
+
+            converge.Queue(() => Task.CompletedTask);
+            await converge.WaitForAllAsync();
+
+            Assert.Contains(listener.Messages, m => m.Contains("OnCompleted") && m.Contains("boom"));
+        }
+        finally
+        {
+            System.Diagnostics.Trace.Listeners.Remove(listener);
+        }
+    }
 }

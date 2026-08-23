@@ -126,4 +126,60 @@ public class AdaptiveConcurrencyTests
         Assert.NotEmpty(observedConcurrency);
         Assert.Contains(observedConcurrency, c => c > 1);
     }
+
+    [Fact]
+    public void AdaptiveConfig_Properties_HaveNoPubliclyAccessibleSetter()
+    {
+        // A record's `with` expression bypasses constructor validation entirely by writing
+        // straight to each property's init accessor. The only way to guarantee the validated
+        // constructor is the sole construction path is for the properties to have no setter at all.
+        foreach (var prop in typeof(AdaptiveConfig).GetProperties())
+        {
+            Assert.Null(prop.SetMethod);
+        }
+    }
+
+    [Fact]
+    public async Task AdjustConcurrency_ScaleDown_WithholdsPermitAtNextCompletion_NotViaRacyAcquire()
+    {
+        // Arrange: a single permit, held by an in-flight task. A synchronous Wait(0) attempt
+        // against this semaphore would fail immediately (nothing free) - and under real
+        // backlog, SemaphoreSlim.Release() always hands a freed permit to an already-registered
+        // async waiter before a fresh synchronous poller ever sees it, so that race is
+        // essentially unwinnable. Scale-down must not depend on winning it.
+        var converge = new ConvergeWait(1, new AdaptiveConfig(MinConcurrency: 1, MaxConcurrency: 4));
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var running = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        converge.Queue(async () =>
+        {
+            running.SetResult(true);
+            await release.Task;
+        });
+        await running.Task;
+
+        // Act: ask to scale down to 0 while the only permit is held.
+        converge.AdjustConcurrencyForTesting(0, cpuUsage: 100f);
+
+        Assert.Equal(0, converge.ReservedSlotsForTesting);
+        Assert.Equal(1, converge.PendingReservationDebtForTesting);
+
+        // The running task's completion must withhold its permit (pay the debt) rather than
+        // releasing it back to the pool.
+        release.SetResult(true);
+        await converge.WaitForAllAsync();
+
+        Assert.Equal(0, converge.PendingReservationDebtForTesting);
+        Assert.Equal(1, converge.ReservedSlotsForTesting);
+        Assert.Equal(0, converge.SemaphoreCurrentCountForTesting);
+
+        // Scaling back up must release that already-reserved slot, not inject a brand-new,
+        // unearned permit into the semaphore.
+        converge.AdjustConcurrencyForTesting(1, cpuUsage: 0f);
+
+        Assert.Equal(0, converge.ReservedSlotsForTesting);
+        Assert.Equal(1, converge.SemaphoreCurrentCountForTesting);
+
+        await converge.DisposeAsync();
+    }
 }

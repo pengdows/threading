@@ -4,6 +4,34 @@ namespace pengdows.threading;
 /// Interface for a task coordinator that limits concurrent execution
 /// and provides progress tracking with optional adaptive throttling.
 /// </summary>
+/// <remarks>
+/// <para>
+/// <see cref="WaitForAllAsync"/> and <see cref="IAsyncDisposable.DisposeAsync"/> give two
+/// different, deliberately different guarantees:
+/// </para>
+/// <list type="bullet">
+///   <item><description>
+///   <b>Quiescence</b> (<see cref="WaitForAllAsync"/>): returns once the tracked work list is
+///   observed empty. It never closes admission, so it is safe to call repeatedly on a still-live
+///   instance - but a <see cref="Queue"/>/<see cref="QueueAsync"/> call that lands concurrently
+///   with the empty-check is not guaranteed to be observed by that particular call. Reliable use
+///   requires the caller to stop producing before awaiting it (every test in this library's own
+///   suite follows that pattern).
+///   </description></item>
+///   <item><description>
+///   <b>Completion</b> (<see cref="IAsyncDisposable.DisposeAsync"/>): permanently closes
+///   admission first (further <see cref="Queue"/>/<see cref="QueueAsync"/> calls throw
+///   <see cref="ObjectDisposedException"/>), then drains every already-accepted task before
+///   returning. This is the only way to get a guarantee that no more work can ever be admitted
+///   as of the moment you call it - at the cost of the instance being unusable afterward.
+///   </description></item>
+/// </list>
+/// <para>
+/// There is currently no primitive that closes admission, drains to true completion, and then
+/// reopens for a new batch on the same instance - only the reusable-but-quiescence-only
+/// <see cref="WaitForAllAsync"/> and the completion-but-terminal <see cref="IAsyncDisposable.DisposeAsync"/>.
+/// </para>
+/// </remarks>
 public interface IConvergeWait : IAsyncDisposable
 {
     /// <summary>
@@ -81,7 +109,9 @@ public interface IConvergeWait : IAsyncDisposable
     Task QueueAsync(Func<Task> workItem, CancellationToken ct = default);
 
     /// <summary>
-    /// Waits for all currently queued tasks to complete.
+    /// Waits until the tracked work list is observed empty - quiescence, not closure-backed
+    /// completion. See the type-level remarks for the distinction from
+    /// <see cref="IAsyncDisposable.DisposeAsync"/>.
     /// </summary>
     Task WaitForAllAsync();
 }
